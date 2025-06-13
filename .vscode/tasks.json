@@ -4,43 +4,33 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-            "label": "watch",
-            "dependsOn": [
-                "npm: watch:tsc",
-                "npm: watch:esbuild"
-            ],
-            "presentation": {
-                "reveal": "never"
-            },
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            }
-        },
-        {
-            "type": "npm",
-            "script": "watch:esbuild",
-            "group": "build",
-            "problemMatcher": "$esbuild-watch",
-            "isBackground": true,
-            "label": "npm: watch:esbuild",
-            "presentation": {
-                "group": "watch",
-                "reveal": "never"
-            }
-        },
+			"type": "npm",
+			"script": "compile",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": [
+				"$tsc",
+				"$esbuild"
+			],
+			"label": "npm: compile",
+			"detail": "Compile the extension"
+		},
 		{
-            "type": "npm",
-            "script": "watch:tsc",
-            "group": "build",
-            "problemMatcher": "$tsc-watch",
-            "isBackground": true,
-            "label": "npm: watch:tsc",
-            "presentation": {
-                "group": "watch",
-                "reveal": "never"
-            }
-        },
+			"type": "npm",
+			"script": "watch",
+			"group": "build",
+			"isBackground": true,
+			"problemMatcher": [
+				"$tsc-watch",
+				"$esbuild-watch"
+			],
+			"presentation": {
+				"reveal": "never"
+			},
+			"label": "npm: watch"
+		},
 		{
 			"type": "npm",
 			"script": "watch-tests",
