@@ -28,7 +28,7 @@
     "url": "https://github.com/yourusername/frolic-extension"
   },
   "publisher": "frolic",
-  "icon": "images/icon.png",
+  "icon": "images/frolic_logo.png",
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",

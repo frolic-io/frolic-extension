@@ -499,7 +499,7 @@ export function activate(context: vscode.ExtensionContext) {
     updateStatusBar('initializing');
 
     // Create and register tree view
-    activityProvider = new FrolicActivityProvider();
+    activityProvider = new FrolicActivityProvider(context);
     const treeView = vscode.window.createTreeView('frolic-activity', {
         treeDataProvider: activityProvider,
         showCollapseAll: true
@@ -837,6 +837,8 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
 class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<FrolicTreeItem | undefined | null | void> = new vscode.EventEmitter<FrolicTreeItem | undefined | null | void>();
     readonly onDidChangeTreeData: vscode.Event<FrolicTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    
+    constructor(private context: vscode.ExtensionContext) {}
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -851,11 +853,14 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             // Root level items
             const items: FrolicTreeItem[] = [];
             
-            // Session info
+            // Session info with custom Frolic logo
+            const logoPath = vscode.Uri.file(path.join(this.context.extensionPath, 'images', 'frolic_logo.png'));
             items.push(new FrolicTreeItem(
-                `📈 Session: ${LOG_BUFFER.length} events`,
+                `Session: ${LOG_BUFFER.length} events`,
                 vscode.TreeItemCollapsibleState.None,
-                'session-info'
+                'session-info',
+                undefined,
+                logoPath
             ));
 
             // Active files
@@ -946,9 +951,13 @@ class FrolicTreeItem extends vscode.TreeItem {
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
         public readonly contextValue: string,
-        public readonly command?: vscode.Command
+        public readonly command?: vscode.Command,
+        public readonly iconPath?: vscode.ThemeIcon | vscode.Uri | { light: vscode.Uri; dark: vscode.Uri }
     ) {
         super(label, collapsibleState);
         this.tooltip = this.label;
+        if (iconPath) {
+            this.iconPath = iconPath;
+        }
     }
 }
