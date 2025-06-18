@@ -371,7 +371,7 @@ function analyzeLogs(logs: any[]): any {
   const codePatterns = new Set<string>();
   const learningSignals: string[] = [];
   const projectStructure: Record<string, string[]> = {};
-  
+
   // Enhanced keyword detection for better topic inference
   const tagKeywords: Record<string, string[]> = {
     react: ["useState", "useEffect", "React.FC", "JSX", "Component", "props", "setState"],
