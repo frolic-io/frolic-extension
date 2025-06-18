@@ -103,7 +103,10 @@ function logEvent(eventType: string, data: any) {
         }
     }
 
+    // Only log in development to avoid logging potentially sensitive code content
+    if (isExtensionDevelopment()) {
     console.log(`[FROLIC] ${eventType}`, entry);
+    }
 }
 
 function writeLogsToFile() {
@@ -128,6 +131,14 @@ function writeLogsToFile() {
 }
 
 function getApiBaseUrl(): string {
+  // Auto-detect development environment
+  const isDevelopment = isExtensionDevelopment();
+  
+  if (isDevelopment) {
+    console.log('[FROLIC] Development environment detected, using localhost');
+    return 'http://localhost:3000';
+  }
+  
   const config = vscode.workspace.getConfiguration('frolic');
   const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.io';
   
@@ -138,6 +149,47 @@ function getApiBaseUrl(): string {
   } catch {
     console.warn('[FROLIC] Invalid API URL in settings, using default');
     return 'https://getfrolic.io';
+  }
+}
+
+function isExtensionDevelopment(): boolean {
+  // Check if we're running in extension development mode
+  try {
+    // Method 1: Check if running from extension development host
+    if (extensionContext?.extensionMode === vscode.ExtensionMode.Development) {
+      return true;
+    }
+    
+    // Method 2: Check if we're in the workspace that contains package.json with our extension
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders) {
+      for (const folder of workspaceFolders) {
+        try {
+          const packagePath = path.join(folder.uri.fsPath, 'package.json');
+          if (fs.existsSync(packagePath)) {
+            const packageContent = fs.readFileSync(packagePath, 'utf8');
+            const packageJson = JSON.parse(packageContent);
+            // Check if this is our extension's package.json
+            if (packageJson.name === 'frolic' && packageJson.publisher === 'frolic') {
+              return true;
+            }
+          }
+        } catch (err) {
+          // Ignore errors reading package.json files
+        }
+      }
+    }
+    
+    // Method 3: Check extension installation path
+    if (extensionContext?.extensionPath && extensionContext.extensionPath.includes('/.vscode/extensions/') === false) {
+      // If not installed in standard extensions folder, likely development
+      return true;
+    }
+    
+    return false;
+  } catch (err) {
+    console.log('[FROLIC] Error detecting development environment:', err);
+    return false;
   }
 }
 
@@ -452,9 +504,9 @@ function analyzeLogs(logs: any[]): any {
       // Aggregate all code changes for backend analysis
       if (changeText.length > 10) {
         codeChangesText += `\n--- ${filePath} (${entry.language}) ---\n${changeText}\n`;
+        }
       }
     }
-  }
 
   // === BASIC STRUCTURAL ANALYSIS (No Semantic Interpretation) ===
   const topFiles = Object.entries(fileActivity)

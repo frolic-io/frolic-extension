@@ -1,8 +1,8 @@
 {
   "name": "frolic",
-  "displayName": "Frolic: Weekly Coding Recaps",
+  "displayName": "Frolic",
   "version": "1.0.1",
-  "description": "Vibe learning tool that passively log your coding activity in VS Code and get personalized weekly digests — learn from how you code, not just what you build.",
+  "description": "Personalized vibe-learning newsletter powered by your coding sessions — learn from how you code, not just what you build.",
   "main": "./out/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run compile",

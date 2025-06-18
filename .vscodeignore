@@ -1,0 +1,47 @@
+# Source files
+src/**
+tsconfig.json
+.vscode-test/**
+.vscode/**
+
+# Build artifacts
+.github/**
+scripts/**
+
+# Development files
+.gitignore
+.git/**
+enhanced-analyzer-example.md
+
+# Dependencies and build
+node_modules/**
+package-lock.json
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+
+# Backup files
+**/*_backup.*
+**/backup_*
+
+# Test files
+test/**
+tests/**
+**/*.test.*
+**/*.spec.*
+
+# Documentation (keep only essential)
+# README.md - KEEP
+# LICENSE - KEEP
+# CHANGELOG.md - KEEP
+# PRIVACY.md - KEEP
+
+# IDE files
+.idea/**
+*.swp
+*.swo
+
+# Large development assets
+images/frolic_logo_backup.png 

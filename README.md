@@ -1,11 +1,11 @@
-# Frolic: Weekly Coding Recaps
+# Frolic
 
-A vibe learning tool that passively logs your coding activity and helps you reflect, grow, and improve — without breaking flow.
+Personalized vibe-learning newsletter powered by your coding sessions — learn from how you code, not just what you build.
 
 ## ✨ Features
 
 - **Passive Activity Logging**: Tracks file edits, languages used, and coding patterns
-- **Weekly Personalized Recaps**: Get insights about your coding journey delivered to your inbox  
+- **Personalized Coding Recaps**: Get insights about your coding journey delivered to your inbox  
 - **Privacy-First Design**: All data stays local until you explicitly sign in and opt-in
 - **Smart Development Detection**: Automatically switches between development and production modes
 - **Activity Dashboard**: View your coding activity right in VS Code's sidebar
@@ -34,11 +34,11 @@ A vibe learning tool that passively logs your coding activity and helps you refl
 
 ### Getting Started
 1. **Install the extension** - Frolic starts logging automatically (locally only)
-2. **Sign in** (optional) - Use Command Palette → `Frolic: Sign In` to enable weekly recaps
+2. **Sign in** (optional) - Use Command Palette → `Frolic: Sign In` to enable personalized recaps
 3. **View activity** - Check the Frolic panel in VS Code's Explorer sidebar
 
 ### Commands
-- `Frolic: Sign In` - Connect to get personalized weekly recaps
+- `Frolic: Sign In` - Connect to get personalized coding recaps
 - `Frolic: Send Digest Now` - Manually send your coding activity (requires sign-in)
 - `Frolic: Flush Logs` - Save activity data to local file
 
@@ -66,7 +66,7 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 ### 1.0.0
 
 - Initial release with comprehensive activity logging
-- Weekly personalized coding recaps via email
+- Personalized coding recaps delivered to your inbox
 - Privacy-first design with local-only logging by default
 - Smart development/production environment detection
 - Activity dashboard and status bar integration
@@ -80,7 +80,7 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 - **File activity**: Which files you edit, programming languages used, lines of code changed
 - **Coding patterns**: When you code, how long you spend on different files, project structure
 - **No personal code**: We never collect the actual content of your code, only metadata about your activity
-- **Account info**: Name and email address (only if you sign up for weekly recaps)
+- **Account info**: Name and email address (only if you sign up for coding recaps)
 
 ### What We DON'T Collect
 - ❌ **Actual code content** - Your code never leaves your machine
@@ -96,7 +96,7 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 - **Open source** - Extension code is public for full transparency
 
 ### Data Usage
-- Generate personalized weekly coding insights and recaps
+- Generate personalized coding insights and recaps
 - Improve the extension based on anonymous usage patterns
 - **Never sold or shared** with third parties
 
