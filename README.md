@@ -13,10 +13,22 @@ A vibe learning tool that passively logs your coding activity and helps you refl
 
 ## 📦 Installation
 
+### VS Code
 1. Open VS Code
 2. Press `Ctrl+Shift+X` (Windows/Linux) or `Cmd+Shift+X` (Mac)
 3. Search for **Frolic**
 4. Click **Install**
+
+### Cursor IDE
+1. Open Cursor
+2. Press `Ctrl+Shift+X` (Windows/Linux) or `Cmd+Shift+X` (Mac)
+3. Search for **Frolic** in the extensions marketplace
+4. Click **Install**
+
+**Alternative for Cursor:** If the extension doesn't appear in Cursor's marketplace:
+1. Download the latest `.vsix` file from our [GitHub Releases](https://github.com/frolic-io/frolic-extension/releases)
+2. In Cursor, press `Ctrl+Shift+P` and select "Extensions: Install from VSIX..."
+3. Select the downloaded `.vsix` file
 
 ## 🚀 Usage
 
