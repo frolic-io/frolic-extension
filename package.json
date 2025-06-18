@@ -27,7 +27,7 @@
     "type": "git",
     "url": "https://github.com/frolic-io/frolic-extension"
   },
-  "publisher": "FrolicPersonalizedCodingRecaps",
+  "publisher": "frolic-io",
   "icon": "images/frolic_logo.png",
   "devDependencies": {
     "@types/node": "^20.0.0",
