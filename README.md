@@ -1,71 +1,54 @@
-# frolic README
+# Frolic
 
-This is the README for your extension "frolic". After writing up a brief description, we recommend including the following sections.
+A Vibe learning toolpassively logs your coding activity and helps you reflect, grow, and improve — without breaking flow.
 
-## Features
+## ✨ Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+- Passive logging of file edits, cursor movement, and more
+- Local buffering and optional on-disk persistence
+- Manual log flushing via command palette
+- Configurable logging toggle in settings
 
-For example if there is an image subfolder under your extension project workspace:
+## 📦 Installation
 
-\!\[feature X\]\(images/feature-x.png\)
+1. Open VS Code
+2. Press `Ctrl+Shift+X` (Windows/Linux) or `Cmd+Shift+X` (Mac)
+3. Search for **Frolic**
+4. Click **Install**
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+## 🚀 Usage
 
-## Requirements
+Once installed, Frolic begins logging automatically.
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+- **Toggle logging** in Settings (`frolic.enableLogging`)
+- **Flush logs** manually by opening the Command Palette and selecting `Frolic: Flush Logs to Disk`
 
-## Extension Settings
+## ⚙️ Configuration
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+| Setting                | Description                            | Default |
+|------------------------|----------------------------------------|---------|
+| `frolic.enableLogging` | Enable/disable passive activity logging | `true`  |
 
-For example:
+## ✅ Requirements
 
-This extension contributes the following settings:
+- VS Code `v1.80.0` or higher
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+## 🐛 Known Issues
 
-## Known Issues
+- None at the moment — please report any at [GitHub Issues](https://github.com/yourusername/frolic-extension/issues)
 
-Calling out known issues can help limit users opening duplicate issues against your extension.
-
-## Release Notes
-
-Users appreciate release notes as you update your extension.
+## 🗒️ Release Notes
 
 ### 1.0.0
 
-Initial release of ...
+- Initial release with file/cursor activity logging
+- Local persistence and manual log flush
+- Configurable logging toggle
 
-### 1.0.1
+## 🔒 Privacy & Data Usage
 
-Fixed issue #.
+Frolic collects activity data (such as file edits, cursor movements, and command usage) to help generate weekly personalized summaries. If you complete onboarding, we also store your name, email, and goals.
 
-### 1.1.0
+All data is stored securely and **never sold**. You may opt out or delete your data at any time.
 
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+See the full [Privacy Policy](./PRIVACY.md) for details.

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+    <!-- Background circle -->
+    <circle cx="64" cy="64" r="60" fill="#4A90E2"/>
+    
+    <!-- Activity lines -->
+    <path d="M30 64 L40 64" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <path d="M30 44 L50 44" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <path d="M30 84 L45 84" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    
+    <!-- Graph line -->
+    <path d="M60 30 L60 98" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <path d="M60 98 L98 98" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    
+    <!-- Data points -->
+    <circle cx="70" cy="80" r="3" fill="white"/>
+    <circle cx="80" cy="60" r="3" fill="white"/>
+    <circle cx="90" cy="40" r="3" fill="white"/>
+    
+    <!-- Connecting lines -->
+    <path d="M70 80 L80 60 L90 40" stroke="white" stroke-width="2" fill="none"/>
+</svg> 
