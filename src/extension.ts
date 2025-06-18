@@ -361,472 +361,197 @@ export async function sendDigestToBackend(
 // --- Digest analyzer logic (from scripts/analyzeLogs.ts) ---
 
 function analyzeLogs(logs: any[]): any {
+  // === RAW DATA COLLECTION (Minimal Processing) ===
   const files = new Set<string>();
   const langCounts: Record<string, number> = {};
   let totalLinesAdded = 0;
   let aiInsertions = 0;
-  const fileActivity: Record<string, { edits: number, linesChanged: number, timeSpent: number }> = {};
-  const topicTags = new Set<string>();
-  const importPatterns = new Set<string>();
-  const codePatterns = new Set<string>();
-  const learningSignals: string[] = [];
-  const projectStructure: Record<string, string[]> = {};
+  const fileActivity: Record<string, { 
+    edits: number; 
+    linesChanged: number; 
+    firstEdit: string; 
+    lastEdit: string;
+    editPattern: number[]; // Time intervals between edits
+  }> = {};
 
-  // Enhanced keyword detection for better topic inference
-  const tagKeywords: Record<string, string[]> = {
-    react: ["useState", "useEffect", "React.FC", "JSX", "Component", "props", "setState"],
-    supabase: ["createClient", "from", "@supabase", "supabase", "database"],
-    regex: ["/[a-z]+/", ".match(", ".test(", "RegExp", "replace("],
-    auth: ["Auth0", "Clerk", "login", "token", "session", "authenticate", "jwt"],
-    fetch: ["fetch(", "axios", "GET", "POST", "api", "endpoint", "request"],
-    typescript: ["interface", "type", "enum", ": string", ": number", "generic", "extends"],
-    testing: ["test(", "expect(", "describe(", "jest", "vitest", "cypress"],
-    styling: ["className", "styled", "css", "tailwind", "@apply", "hover:"],
-    database: ["SELECT", "INSERT", "UPDATE", "DELETE", "schema", "migration"],
-    deployment: ["docker", "kubernetes", "deploy", "build", "ci/cd", "github actions"],
-    performance: ["useMemo", "useCallback", "lazy(", "Suspense", "optimization"],
-    state: ["redux", "zustand", "context", "provider", "store", "dispatch"],
-    ai: ["openai", "anthropic", "langchain", "embeddings", "prompt", "llm"],
-    security: ["bcrypt", "jwt", "cors", "helmet", "sanitize", "validation"],
-    mobile: ["react-native", "expo", "ios", "android", "mobile"],
-    devtools: ["webpack", "vite", "rollup", "babel", "eslint", "prettier"]
-  };
-
-  // Pattern recognition for code complexity and learning
-  const codePatternDetection = {
-    functions: /function\s+\w+|const\s+\w+\s*=\s*\(/g,
-    classes: /class\s+\w+|interface\s+\w+/g,
-    imports: /import\s+.*?from\s+['"`]([^'"`]+)['"`]/g,
-    exports: /export\s+(default\s+)?/g,
-    async: /async\s+|await\s+/g,
-    errors: /try\s*{|catch\s*\(|throw\s+/g,
-    loops: /for\s*\(|while\s*\(|\.map\(|\.forEach\(/g,
-    conditionals: /if\s*\(|switch\s*\(|\?\s*:/g,
-    hooks: /use[A-Z]\w*/g,
-    components: /<[A-Z]\w*|function\s+[A-Z]\w*/g
-  };
-
-  // Session timing analysis
+  // Session timing
   const sessionStart = logs.length > 0 ? new Date(logs[0].timestamp) : new Date();
   const sessionEnd = logs.length > 0 ? new Date(logs[logs.length - 1].timestamp) : new Date();
   const sessionDuration = (sessionEnd.getTime() - sessionStart.getTime()) / 1000 / 60; // minutes
 
-  // Process each log entry
-  for (const entry of logs) {
+  // Raw text aggregation for backend analysis
+  let codeChangesText = '';
+  const codeChangesSample: any[] = [];
+  const importStatements: string[] = [];
+  const fileExtensions = new Set<string>();
+  const directoryStructure: Record<string, number> = {};
+
+  // Process each log entry - MINIMAL processing, maximum raw data
+  for (let i = 0; i < logs.length; i++) {
+    const entry = logs[i];
     if (entry.eventType !== 'file_edit') continue;
 
     const filePath = entry.relativePath;
     files.add(filePath);
     langCounts[entry.language] = (langCounts[entry.language] || 0) + 1;
 
-    // Enhanced file activity tracking
+    // File extension tracking
+    const ext = filePath.split('.').pop()?.toLowerCase() || 'unknown';
+    fileExtensions.add(ext);
+
+    // Directory structure (for project understanding)
+    const dir = filePath.split('/').slice(0, -1).join('/') || 'root';
+    directoryStructure[dir] = (directoryStructure[dir] || 0) + 1;
+
+    // File activity tracking with timing
     if (!fileActivity[filePath]) {
-      fileActivity[filePath] = { edits: 0, linesChanged: 0, timeSpent: 0 };
+      fileActivity[filePath] = { 
+        edits: 0, 
+        linesChanged: 0, 
+        firstEdit: entry.timestamp,
+        lastEdit: entry.timestamp,
+        editPattern: []
+      };
     }
     fileActivity[filePath].edits++;
+    fileActivity[filePath].lastEdit = entry.timestamp;
 
-    // Project structure analysis
-    const pathParts = filePath.split('/');
-    const directory = pathParts.slice(0, -1).join('/') || 'root';
-    if (!projectStructure[directory]) {
-      projectStructure[directory] = [];
-    }
-    if (!projectStructure[directory].includes(pathParts[pathParts.length - 1])) {
-      projectStructure[directory].push(pathParts[pathParts.length - 1]);
+    // Calculate edit intervals for pattern analysis
+    if (i > 0 && logs[i-1].relativePath === filePath) {
+      const timeDiff = (new Date(entry.timestamp).getTime() - new Date(logs[i-1].timestamp).getTime()) / 1000;
+      fileActivity[filePath].editPattern.push(timeDiff);
     }
 
-    // Analyze each code change
+    // Process code changes - collect raw data
     for (const change of entry.changes || []) {
       const changeText = change.changeText || '';
-      const linesChanged = Math.abs(change.lineCountDelta || 0);
       
       totalLinesAdded += change.lineCountDelta || 0;
-      fileActivity[filePath].linesChanged += linesChanged;
+      fileActivity[filePath].linesChanged += Math.abs(change.lineCountDelta || 0);
       
       if (change.likelyAI) aiInsertions++;
 
-      // Enhanced topic detection
-      for (const [topic, keywords] of Object.entries(tagKeywords)) {
-        if (keywords.some(kw => changeText.toLowerCase().includes(kw.toLowerCase()))) {
-          topicTags.add(topic);
-        }
-      }
-
-      // Import pattern detection with proper typing
-      const importMatches = changeText.match(codePatternDetection.imports);
-      if (importMatches) {
-        importMatches.forEach((match: string) => {
-          const importPath = match.match(/from\s+['"`]([^'"`]+)['"`]/)?.[1];
-          if (importPath) {
-            importPatterns.add(importPath);
-          }
+      // Collect raw code samples (first 100 significant changes)
+      if (changeText.length > 20 && codeChangesSample.length < 100) {
+        codeChangesSample.push({
+          file: filePath,
+          language: entry.language,
+          timestamp: entry.timestamp,
+          change: changeText.substring(0, 500), // Limit size but keep raw
+          size: change.textLength,
+          type: change.textLength > change.rangeLength ? 'addition' : 'modification'
         });
       }
 
-      // Code pattern analysis
-      for (const [pattern, regex] of Object.entries(codePatternDetection)) {
-        const matches = changeText.match(regex);
-        if (matches && matches.length > 0) {
-          codePatterns.add(`${pattern}:${matches.length}`);
-        }
+      // Extract import statements (structural information)
+      const importMatches = changeText.match(/import\s+.*?from\s+['"`]([^'"`]+)['"`]/g);
+      if (importMatches) {
+        importStatements.push(...importMatches.slice(0, 5)); // Limit to prevent spam
       }
 
-      // Learning signal detection (new concepts, repeated patterns, etc.)
-      if (changeText.length > 50 && change.textLength > change.rangeLength) {
-        // Significant addition - might be learning something new
-        const newConcepts = [];
-        if (changeText.includes('interface ') && !learningSignals.some(s => s.includes('typescript-interfaces'))) {
-          newConcepts.push('typescript-interfaces');
-        }
-        if (changeText.includes('useEffect') && !learningSignals.some(s => s.includes('react-effects'))) {
-          newConcepts.push('react-effects');
-        }
-        if (changeText.includes('async ') && !learningSignals.some(s => s.includes('async-programming'))) {
-          newConcepts.push('async-programming');
-        }
-        if (changeText.includes('useState') && !learningSignals.some(s => s.includes('react-state'))) {
-          newConcepts.push('react-state');
-        }
-        if (changeText.includes('supabase') && !learningSignals.some(s => s.includes('database-integration'))) {
-          newConcepts.push('database-integration');
-        }
-        if (changeText.includes('test(') && !learningSignals.some(s => s.includes('unit-testing'))) {
-          newConcepts.push('unit-testing');
-        }
-        learningSignals.push(...newConcepts);
+      // Aggregate all code changes for backend analysis
+      if (changeText.length > 10) {
+        codeChangesText += `\n--- ${filePath} (${entry.language}) ---\n${changeText}\n`;
       }
     }
   }
 
-  // Calculate derived insights
+  // === BASIC STRUCTURAL ANALYSIS (No Semantic Interpretation) ===
   const topFiles = Object.entries(fileActivity)
     .sort((a, b) => b[1].edits - a[1].edits)
-    .slice(0, 5)
-    .map(([file, stats]) => ({ file, ...stats }));
+    .slice(0, 10)
+    .map(([file, stats]) => ({
+      file,
+      edits: stats.edits,
+      linesChanged: stats.linesChanged,
+      sessionDuration: (new Date(stats.lastEdit).getTime() - new Date(stats.firstEdit).getTime()) / 1000 / 60,
+      editFrequency: stats.editPattern.length > 0 ? stats.editPattern.reduce((a, b) => a + b, 0) / stats.editPattern.length : 0
+    }));
 
-  const mostActiveDirectory = Object.entries(projectStructure)
-    .sort((a, b) => b[1].length - a[1].length)[0];
+  const workingDirectories = Object.entries(directoryStructure)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5);
 
-  const codingVelocity = sessionDuration > 0 ? Math.round(totalLinesAdded / sessionDuration) : 0;
-  
-  // Project type inference
-  const projectType = inferProjectType(Array.from(importPatterns), Array.from(topicTags));
-  
-  // Complexity analysis
-  const complexityScore = calculateComplexityScore(Array.from(codePatterns), totalLinesAdded);
-
+  // === RETURN RAW DATA + MINIMAL STRUCTURE ===
   return {
-    // Basic metrics (backwards compatible)
+    // === BACKWARDS COMPATIBLE (keep existing fields) ===
     filesEdited: files.size,
     totalLinesAdded,
     aiInsertions,
-    topFiles: topFiles.map(f => f.file), // Keep backwards compatibility
+    topFiles: topFiles.map(f => f.file),
     languagesUsed: langCounts,
-    inferredTopics: Array.from(topicTags),
-    
-    // Enhanced metrics for LLM processing
-    sessionMetrics: {
+    inferredTopics: [], // Empty - let backend infer
+
+    // === RAW DATA FOR BACKEND ANALYSIS ===
+    rawData: {
+      // Session context
+      sessionId: sessionId,
       duration: Math.round(sessionDuration),
       startTime: sessionStart.toISOString(),
       endTime: sessionEnd.toISOString(),
-      codingVelocity, // lines per minute
-      filesPerMinute: sessionDuration > 0 ? Math.round(files.size / sessionDuration * 10) / 10 : 0,
-      averageEditSize: totalLinesAdded / Math.max(1, topFiles.reduce((sum, f) => sum + f.edits, 0)),
-      productivityLevel: getProductivityLevel(codingVelocity, files.size, sessionDuration)
-    },
-    
-    detailedFileActivity: topFiles,
-    
-    codeInsights: {
-      importPatterns: Array.from(importPatterns).slice(0, 10),
-      codePatterns: Array.from(codePatterns).slice(0, 15),
-      projectType,
-      complexityScore,
-      architecturalPatterns: detectArchitecturalPatterns(Array.from(topicTags), projectStructure)
-    },
-    
-    learningAnalysis: {
-      newConceptsEncountered: learningSignals,
-      practicePatterns: detectPracticePatterns(fileActivity, codePatterns),
-      problemSolvingSignals: detectProblemSolving(logs),
-      knowledgeGaps: identifyKnowledgeGaps(Array.from(topicTags), Array.from(codePatterns))
-    },
-    
-    projectStructure: {
-      directories: Object.keys(projectStructure).length,
-      mostActiveDirectory: mostActiveDirectory?.[0] || 'unknown',
-      fileTypes: getFileTypeDistribution(Array.from(files)),
-      structureComplexity: calculateStructureComplexity(projectStructure)
-    },
-    
-    workflowInsights: {
-      editingPatterns: analyzeEditingPatterns(logs),
-      focusAreas: identifyFocusAreas(fileActivity, sessionDuration),
-      developmentStage: inferDevelopmentStage(topicTags, codePatterns, totalLinesAdded),
-      codingStyle: analyzeCodingStyle(Array.from(codePatterns), Array.from(topicTags)),
-      timeDistribution: analyzeTimeDistribution(fileActivity, sessionDuration)
+      
+      // File and code structure
+      fileExtensions: Array.from(fileExtensions),
+      workingDirectories: workingDirectories,
+      detailedFileActivity: topFiles,
+      
+      // Raw code samples for LLM analysis
+      codeChangesSample: codeChangesSample,
+      importStatements: Array.from(new Set(importStatements)).slice(0, 20),
+      
+      // Behavioral patterns (structural, not semantic)
+      codingVelocity: sessionDuration > 0 ? Math.round(totalLinesAdded / sessionDuration) : 0,
+      editPatterns: {
+        rapidEdits: logs.filter((log, i) => {
+          if (i === 0) return false;
+          const timeDiff = new Date(log.timestamp).getTime() - new Date(logs[i-1].timestamp).getTime();
+          return timeDiff < 30000 && log.relativePath === logs[i-1].relativePath;
+        }).length,
+        fileJumping: new Set(logs.map(log => log.relativePath)).size,
+        sessionIntensity: logs.length / Math.max(sessionDuration, 1)
+      },
+      
+      // Context for backend analysis
+      projectStructure: {
+        totalDirectories: Object.keys(directoryStructure).length,
+        fileTypeDistribution: Object.fromEntries(
+          Array.from(fileExtensions).map(ext => [ext, 
+            Array.from(files).filter(f => f.endsWith(`.${ext}`)).length
+          ])
+        ),
+                 complexityIndicators: {
+           avgEditsPerFile: files.size > 0 ? logs.filter(l => l.eventType === 'file_edit').length / files.size : 0,
+           totalCodeChanges: codeChangesSample.length,
+           largestChangeSize: codeChangesSample.length > 0 ? Math.max(...codeChangesSample.map(c => c.size)) : 0
+         }
+      }
     },
 
-    // Content generation hints for LLM
-    contentHints: {
-      newsletterTopics: generateNewsletterTopics(Array.from(topicTags), learningSignals, projectType),
-      teachingOpportunities: identifyTeachingOpportunities(learningSignals, Array.from(codePatterns)),
-      challengingAreas: identifyChallengingAreas(logs, Array.from(codePatterns)),
-      celebrationMoments: identifyCelebrationMoments(totalLinesAdded, aiInsertions, learningSignals),
-      nextSteps: suggestNextSteps(Array.from(topicTags), learningSignals, complexityScore)
+    // === ANALYSIS HINTS FOR BACKEND (Not hardcoded conclusions) ===
+    analysisContext: {
+      // What the backend should consider analyzing
+      suggestedAnalysis: [
+        'technology_stack_identification',
+        'learning_progress_detection', 
+        'coding_patterns_analysis',
+        'project_complexity_assessment',
+        'productivity_insights',
+        'personalized_recommendations'
+      ],
+      
+      // Provide context, not conclusions
+      sessionCharacteristics: {
+        isLongSession: sessionDuration > 60,
+        isIntenseSession: logs.length > 100,
+        isMultiFileSession: files.size > 5,
+        hasLargeChanges: totalLinesAdded > 200,
+        showsAIUsage: aiInsertions > 0
+      }
     }
   };
 }
 
-// Helper functions for enhanced analysis
-function inferProjectType(imports: string[], topics: string[]): string {
-  if (imports.some(imp => imp.includes('next')) || topics.includes('react')) return 'Next.js/React App';
-  if (imports.some(imp => imp.includes('express')) || topics.includes('node')) return 'Node.js Backend';
-  if (imports.some(imp => imp.includes('vue'))) return 'Vue.js App';
-  if (topics.includes('database') && topics.includes('api')) return 'Full-Stack Application';
-  if (topics.includes('testing')) return 'Testing/QA Project';
-  return 'Web Application';
-}
-
-function calculateComplexityScore(patterns: string[], linesAdded: number): number {
-  let score = 0;
-  patterns.forEach(pattern => {
-    const [type, count] = pattern.split(':');
-    const numCount = parseInt(count) || 0;
-    switch (type) {
-      case 'functions': score += numCount * 2; break;
-      case 'classes': score += numCount * 3; break;
-      case 'async': score += numCount * 2; break;
-      case 'errors': score += numCount * 1; break;
-      default: score += numCount * 1;
-    }
-  });
-  return Math.min(100, Math.round(score + (linesAdded / 100)));
-}
-
-function detectArchitecturalPatterns(topics: string[], structure: Record<string, string[]>): string[] {
-  const patterns = [];
-  if (topics.includes('react') && Object.keys(structure).some(dir => dir.includes('components'))) {
-    patterns.push('Component-Based Architecture');
-  }
-  if (Object.keys(structure).some(dir => dir.includes('api')) || topics.includes('fetch')) {
-    patterns.push('API-Driven Development');
-  }
-  if (topics.includes('state') || topics.includes('redux')) {
-    patterns.push('State Management Pattern');
-  }
-  return patterns;
-}
-
-function detectPracticePatterns(fileActivity: Record<string, any>, patterns: Set<string>): string[] {
-  const practice = [];
-  const totalEdits = Object.values(fileActivity).reduce((sum: number, f: any) => sum + f.edits, 0);
-  
-  if (totalEdits > 20) practice.push('intensive-coding-session');
-  if (patterns.has('functions:5') || patterns.has('functions:10')) practice.push('function-composition-practice');
-  if (Array.from(patterns).some(p => p.includes('errors'))) practice.push('error-handling-practice');
-  
-  return practice;
-}
-
-function detectProblemSolving(logs: any[]): string[] {
-  const signals = [];
-  let quickEdits = 0;
-  
-  for (let i = 1; i < logs.length; i++) {
-    const timeDiff = new Date(logs[i].timestamp).getTime() - new Date(logs[i-1].timestamp).getTime();
-    if (timeDiff < 30000 && logs[i].eventType === 'file_edit') { // Less than 30 seconds apart
-      quickEdits++;
-    }
-  }
-  
-  if (quickEdits > 10) signals.push('rapid-iteration-debugging');
-  if (logs.some(log => log.changes?.some((c: any) => c.changeText?.includes('console.log')))) {
-    signals.push('debug-logging-approach');
-  }
-  
-  return signals;
-}
-
-function identifyKnowledgeGaps(topics: string[], patterns: string[]): string[] {
-  const gaps = [];
-  
-  if (topics.includes('typescript') && !patterns.some(p => p.includes('interfaces'))) {
-    gaps.push('typescript-interface-usage');
-  }
-  if (topics.includes('react') && !topics.includes('testing')) {
-    gaps.push('react-testing-patterns');
-  }
-  if (patterns.some(p => p.includes('async')) && !topics.includes('errors')) {
-    gaps.push('async-error-handling');
-  }
-  
-  return gaps;
-}
-
-function getFileTypeDistribution(files: string[]): Record<string, number> {
-  const distribution: Record<string, number> = {};
-  files.forEach(file => {
-    const ext = file.split('.').pop() || 'unknown';
-    distribution[ext] = (distribution[ext] || 0) + 1;
-  });
-  return distribution;
-}
-
-function calculateStructureComplexity(structure: Record<string, string[]>): number {
-  const totalDirs = Object.keys(structure).length;
-  const totalFiles = Object.values(structure).reduce((sum, files) => sum + files.length, 0);
-  const avgFilesPerDir = totalFiles / Math.max(1, totalDirs);
-  
-  if (totalDirs > 10 || avgFilesPerDir > 8) return 3; // High
-  if (totalDirs > 5 || avgFilesPerDir > 4) return 2; // Medium
-  return 1; // Low
-}
-
-function analyzeEditingPatterns(logs: any[]): string[] {
-  const patterns = [];
-  const fileEdits: Record<string, number> = {};
-  
-  logs.forEach(log => {
-    if (log.eventType === 'file_edit') {
-      fileEdits[log.relativePath] = (fileEdits[log.relativePath] || 0) + 1;
-    }
-  });
-  
-  const maxEdits = Math.max(...Object.values(fileEdits));
-  if (maxEdits > 20) patterns.push('deep-focus-single-file');
-  if (Object.keys(fileEdits).length > 10) patterns.push('multi-file-coordination');
-  
-  return patterns;
-}
-
-function identifyFocusAreas(fileActivity: Record<string, any>, sessionDuration: number): string[] {
-  const areas = [];
-  const topFile = Object.entries(fileActivity)
-    .sort((a, b) => b[1].edits - a[1].edits)[0];
-  
-  if (topFile && topFile[1].edits > 15) {
-    if (topFile[0].includes('component') || topFile[0].includes('.tsx')) areas.push('frontend-components');
-    if (topFile[0].includes('api') || topFile[0].includes('server')) areas.push('backend-api');
-    if (topFile[0].includes('test')) areas.push('testing');
-    if (topFile[0].includes('style') || topFile[0].includes('.css')) areas.push('styling');
-  }
-  
-  return areas;
-}
-
-function inferDevelopmentStage(topics: Set<string>, patterns: Set<string>, linesAdded: number): string {
-  if (linesAdded > 500 && Array.from(patterns).some(p => p.includes('functions'))) return 'active-development';
-  if (topics.has('testing') || Array.from(patterns).some(p => p.includes('errors'))) return 'testing-debugging';
-  if (linesAdded < 100 && topics.has('styling')) return 'refinement-polishing';
-  if (topics.has('deployment') || topics.has('ci/cd')) return 'deployment-ops';
-  return 'feature-building';
-}
-
-function getProductivityLevel(velocity: number, filesCount: number, duration: number): string {
-  if (velocity > 10 && filesCount > 5) return 'high';
-  if (velocity > 5 && filesCount > 2) return 'medium';
-  if (duration > 30) return 'focused';
-  return 'learning';
-}
-
-function analyzeCodingStyle(patterns: string[], topics: string[]): string {
-  if (patterns.some(p => p.includes('functions')) && topics.includes('typescript')) return 'functional-typed';
-  if (patterns.some(p => p.includes('classes'))) return 'object-oriented';
-  if (patterns.some(p => p.includes('hooks')) && topics.includes('react')) return 'modern-react';
-  if (topics.includes('testing')) return 'test-driven';
-  return 'exploratory';
-}
-
-function analyzeTimeDistribution(fileActivity: Record<string, any>, totalDuration: number): Record<string, number> {
-  const distribution: Record<string, number> = {};
-  const totalEdits = Object.values(fileActivity).reduce((sum: any, f: any) => sum + f.edits, 0);
-  
-  Object.entries(fileActivity).forEach(([file, stats]: [string, any]) => {
-    const timePercent = Math.round((stats.edits / totalEdits) * 100);
-    const fileName = file.split('/').pop() || file;
-    distribution[fileName] = timePercent;
-  });
-  
-  return distribution;
-}
-
-function generateNewsletterTopics(topics: string[], learningSignals: string[], projectType: string): string[] {
-  const newsletterTopics = [];
-  
-  if (topics.includes('react') && learningSignals.includes('react-effects')) {
-    newsletterTopics.push('Mastering React useEffect: Side Effects and Cleanup');
-  }
-  if (topics.includes('typescript') && learningSignals.includes('typescript-interfaces')) {
-    newsletterTopics.push('TypeScript Interfaces: Building Type-Safe Applications');
-  }
-  if (topics.includes('supabase') && projectType.includes('Full-Stack')) {
-    newsletterTopics.push('Building Real-time Apps with Supabase');
-  }
-  if (topics.includes('performance')) {
-    newsletterTopics.push('React Performance Optimization Strategies');
-  }
-  
-  return newsletterTopics;
-}
-
-function identifyTeachingOpportunities(learningSignals: string[], patterns: string[]): string[] {
-  const opportunities = [];
-  
-  if (learningSignals.includes('async-programming')) {
-    opportunities.push('Deep dive into JavaScript Promises and async/await');
-  }
-  if (learningSignals.includes('react-state')) {
-    opportunities.push('Understanding React state management patterns');
-  }
-  if (patterns.some(p => p.includes('errors'))) {
-    opportunities.push('Error handling best practices in modern JavaScript');
-  }
-  
-  return opportunities;
-}
-
-function identifyChallengingAreas(logs: any[], patterns: string[]): string[] {
-  const challenges = [];
-  
-  // Look for rapid edits in same file (suggests struggling)
-  const rapidEdits = logs.filter((log, i) => {
-    if (i === 0) return false;
-    const timeDiff = new Date(log.timestamp).getTime() - new Date(logs[i-1].timestamp).getTime();
-    return timeDiff < 60000 && log.relativePath === logs[i-1].relativePath;
-  });
-  
-  if (rapidEdits.length > 15) challenges.push('debugging-complex-issues');
-  if (patterns.some(p => p.includes('async') && p.includes('errors'))) challenges.push('asynchronous-error-handling');
-  
-  return challenges;
-}
-
-function identifyCelebrationMoments(linesAdded: number, aiInsertions: number, learningSignals: string[]): string[] {
-  const celebrations = [];
-  
-  if (linesAdded > 300) celebrations.push('productive-coding-session');
-  if (learningSignals.length > 2) celebrations.push('multiple-new-concepts-learned');
-  if (aiInsertions === 0 && linesAdded > 100) celebrations.push('independent-problem-solving');
-  
-  return celebrations;
-}
-
-function suggestNextSteps(topics: string[], learningSignals: string[], complexity: number): string[] {
-  const nextSteps = [];
-  
-  if (topics.includes('react') && !topics.includes('testing')) {
-    nextSteps.push('Add testing to your React components');
-  }
-  if (complexity < 30) {
-    nextSteps.push('Try implementing more complex features');
-  }
-  if (topics.includes('supabase') && !topics.includes('security')) {
-    nextSteps.push('Learn about database security and RLS policies');
-  }
-  
-  return nextSteps;
-}
+// Removed all helper functions - analysis now done by backend
 
 export async function signInCommand(context: vscode.ExtensionContext) {
   const state = uuidv4();
