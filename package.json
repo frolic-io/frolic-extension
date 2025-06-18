@@ -25,19 +25,19 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/frolic-extension"
+    "url": "https://github.com/frolic-io/frolic-extension"
   },
-  "publisher": "frolic",
+  "publisher": "FrolicPersonalizedCodingRecaps",
   "icon": "images/frolic_logo.png",
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",
-    "@types/vscode": "^1.101.0",
+    "@types/vscode": "1.85.0",
     "typescript": "^5.0.0",
     "vsce": "^2.15.0"
   },
   "engines": {
-    "vscode": "^1.80.0"
+    "vscode": "^1.85.0"
   },
   "activationEvents": [
     "onStartupFinished"
@@ -68,15 +68,15 @@
         },
         "frolic.apiBaseUrl": {
           "type": "string",
-          "default": "http://localhost:3000",
-          "description": "Base URL for Frolic API endpoints. Set to your local backend for development, or leave as default for production."
+          "default": "https://getfrolic.io",
+          "description": "Base URL for Frolic API endpoints. Automatically uses localhost:3000 in development."
         },
         "frolic.digestFrequencyHours": {
           "type": "number",
-          "default": 4,
+          "default": 24,
           "minimum": 1,
           "maximum": 168,
-          "description": "How often to send coding activity digests to Frolic (in hours). Default is 4 hours."
+          "description": "How often to send coding activity digests to Frolic (in hours). Default is 24 hours (daily)."
         },
         "frolic.maxBufferSize": {
           "type": "number",
@@ -94,7 +94,10 @@
         },
         "frolic.tokenExpiration": {
           "type": "string",
-          "enum": ["short", "long"],
+          "enum": [
+            "short",
+            "long"
+          ],
           "default": "long",
           "enumDescriptions": [
             "Short-lived tokens (15 minutes) with automatic refresh",
