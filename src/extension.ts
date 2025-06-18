@@ -617,8 +617,8 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-            await sendDigestImmediately(context);
-            vscode.window.showInformationMessage(`✅ Frolic: Digest sent successfully! (${LOG_BUFFER.length} events processed)`);
+            const eventCount = await sendDigestImmediately(context);
+            vscode.window.showInformationMessage(`✅ Frolic: Digest sent successfully! (${eventCount} events processed)`);
         } catch (err: any) {
             if (err.message === 'NO_AUTH_TOKEN') {
                 vscode.window.showWarningMessage('🔐 Frolic: Please sign in first to send digests', 'Sign In')
@@ -735,9 +735,10 @@ function startPeriodicDigestSending(context: vscode.ExtensionContext) {
     console.log(`[FROLIC] Periodic digest timer started (every ${frequencyHours} hours)`);
 }
 
-async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetries: number = 3) {
+async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetries: number = 3): Promise<number> {
     if (LOG_BUFFER.length > 0) {
-        console.log(`[FROLIC] Sending digest with ${LOG_BUFFER.length} events`);
+        const eventCount = LOG_BUFFER.length; // Capture count before clearing
+        console.log(`[FROLIC] Sending digest with ${eventCount} events`);
         updateStatusBar('sending');
         
         const digest = analyzeLogs(LOG_BUFFER);
@@ -754,7 +755,7 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 sessionId = uuidv4();
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
                 updateStatusBar('authenticated');
-                return; // Success - exit retry loop
+                return eventCount; // Return the number of events processed
             } catch (err: any) {
                 lastError = err;
                 console.log(`[FROLIC] Digest send attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}`);
@@ -763,11 +764,11 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 if (err.message === 'NO_AUTH_TOKEN' || err.message === 'AUTH_TOKEN_EXPIRED') {
                     // Auth errors - don't retry, update status
                     updateStatusBar('unauthenticated');
-                    return; // Exit without clearing buffer
+                    return 0; // Exit without clearing buffer
                 } else if (err.message === 'ACCESS_FORBIDDEN' || err.message === 'CLIENT_ERROR') {
                     // Client errors - don't retry
                     updateStatusBar('error');
-                    return; // Exit without clearing buffer
+                    return 0; // Exit without clearing buffer
                 }
                 
                 // For network/server errors, retry with exponential backoff
@@ -783,9 +784,11 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
         console.error(`[FROLIC] Failed to send digest after ${maxRetries + 1} attempts. Last error: ${lastError?.message}`);
         updateStatusBar('error');
         // Don't clear buffer - will retry next interval
+        return 0;
     } else {
         console.log('[FROLIC] No activity to send in digest');
         updateStatusBar('authenticated');
+        return 0;
     }
 }
 
