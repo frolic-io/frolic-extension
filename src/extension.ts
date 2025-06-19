@@ -804,8 +804,14 @@ async function initializeAuthenticationFlow(context: vscode.ExtensionContext) {
                 context.globalState.update('frolic.hasEverRun', true);
                 
                 // Small delay to ensure VS Code is fully loaded
-                setTimeout(() => {
-                    vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+                setTimeout(async () => {
+                    try {
+                        await vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+                    } catch (error) {
+                        // Fallback for Cursor - show welcome message instead
+                        console.log('[FROLIC] Walkthrough not available, showing welcome message');
+                        vscode.commands.executeCommand('frolic.showWelcome');
+                    }
                 }, 2000);
                 
                 return; // Don't show other prompts on first run
@@ -978,8 +984,26 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(signInCmd);
 
     // Register welcome walkthrough command
-    const showWelcomeCmd = vscode.commands.registerCommand('frolic.showWelcome', () => {
-        vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+    const showWelcomeCmd = vscode.commands.registerCommand('frolic.showWelcome', async () => {
+        try {
+            // Try VS Code walkthrough command first
+            await vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+        } catch (error) {
+            // Fallback for Cursor or other editors that don't support walkthroughs
+            console.log('[FROLIC] Walkthrough command not available, showing welcome message instead');
+            const selection = await vscode.window.showInformationMessage(
+                '🌟 Welcome to Frolic!\n\nFrolic tracks your coding activity to provide personalized insights and learning recaps.',
+                'Sign In to Get Started',
+                'Learn More',
+                'Got It'
+            );
+            
+            if (selection === 'Sign In to Get Started') {
+                vscode.commands.executeCommand('frolic.signIn');
+            } else if (selection === 'Learn More') {
+                vscode.env.openExternal(vscode.Uri.parse('https://getfrolic.io'));
+            }
+        }
     });
     context.subscriptions.push(showWelcomeCmd);
 
