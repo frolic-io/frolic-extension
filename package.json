@@ -32,7 +32,6 @@
   "icon": "images/frolic_logo.png",
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/uuid": "^10.0.0",
     "@types/vscode": "1.85.0",
     "typescript": "^5.0.0",
     "vsce": "^2.15.0"
@@ -120,8 +119,7 @@
       "explorer": [
         {
           "id": "frolic-activity",
-          "name": "Frolic Activity",
-          "when": "frolic.showActivityView"
+          "name": "Frolic Activity"
         }
       ]
     },
@@ -167,7 +165,6 @@
   },
   "dependencies": {
     "@types/node-fetch": "^2.6.12",
-    "node-fetch": "^2.7.0",
-    "uuid": "^11.1.0"
+    "node-fetch": "^2.7.0"
   }
 }

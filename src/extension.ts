@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { v4 as uuidv4 } from 'uuid';
+// Use crypto.randomUUID() instead of uuid package to avoid bundling issues
+// This is built into Node.js 15+ and VS Code runtime
 import * as crypto from 'crypto';
 const fetch = require('node-fetch');
 
 const LOG_BUFFER: any[] = [];
 const MAX_CHANGE_TEXT_LENGTH = 2000; // Truncate very large code changes
 let isLoggingEnabled = true;
-let sessionId = uuidv4();
+let sessionId = crypto.randomUUID();
 let digestTimer: NodeJS.Timeout | null = null;
 let bufferMemoryUsage = 0; // Track estimated memory usage in bytes
 let statusBarItem: vscode.StatusBarItem;
@@ -613,7 +614,7 @@ export async function signInCommand(context: vscode.ExtensionContext) {
   
   try {
     // Generate PKCE parameters
-    const state = uuidv4();
+    const state = crypto.randomUUID();
     const codeVerifier = generateCodeVerifier();
     const codeChallenge = generateCodeChallenge(codeVerifier);
     const apiBaseUrl = getApiBaseUrl();
@@ -1105,7 +1106,7 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 // Clear buffer and start new session after successful send
                 LOG_BUFFER.length = 0;
                 bufferMemoryUsage = 0; // Reset memory tracking
-                sessionId = uuidv4();
+                sessionId = crypto.randomUUID();
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
                 updateStatusBar('authenticated');
                 return eventCount; // Return the number of events processed
