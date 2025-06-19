@@ -41,7 +41,11 @@
     "vscode": "^1.85.0"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:frolic.signIn",
+    "onCommand:frolic.flushLogs",
+    "onCommand:frolic.sendDigest",
+    "onCommand:frolic.showWelcome"
   ],
   "contributes": {
     "commands": [
