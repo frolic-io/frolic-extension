@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Personalized vibe-learning newsletter powered by your coding sessions — learn from how you code, not just what you build.",
   "main": "./out/extension.js",
   "scripts": {
@@ -141,7 +141,7 @@
             "title": "Sign In to Enable Cloud Sync",
             "description": "Sign in to sync your coding activity and receive personalized recaps via email.\n\n[Sign In to Frolic](command:frolic.signIn)\n\n*Note: Frolic works locally without signing in, but you'll miss out on personalized insights and recaps.*",
             "media": {
-              "image": "images/frolic_logo.png", 
+              "image": "images/frolic_logo.png",
               "altText": "Sign in to Frolic"
             },
             "completionEvents": [
