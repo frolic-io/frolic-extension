@@ -105,3 +105,6 @@ Thumbs.db
 
 # Frolic specific files
 .frolic-log.json 
+
+# Deployment scripts (may contain sensitive tokens/info)
+scripts/deploy.sh

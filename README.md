@@ -4,12 +4,23 @@ Personalized vibe-learning newsletter powered by your coding sessions — learn 
 
 ## ✨ Features
 
-- **Passive Activity Logging**: Tracks file edits, languages used, and coding patterns
-- **Personalized Coding Recaps**: Get insights about your coding journey delivered to your inbox  
+### 📊 **Activity Insights (No Sign-in Required)**
+- **Real-time Activity Panel**: View your coding session stats, file changes, and productivity metrics right in VS Code's sidebar
+- **Session Tracking**: Monitor your current coding session duration and activity levels
+- **File & Language Analytics**: See which files and programming languages you're working with most
+- **Event Buffering**: Track coding events with visual indicators for digest readiness
+- **Local Data Export**: Export your coding activity to JSON files for personal analysis
+
+### 🎯 **Enhanced Features (Sign-in Required)**
+- **Personalized Coding Recaps**: Get AI-powered insights about your coding journey delivered to your inbox
+- **Smart Digest Generation**: Automatically curated summaries of your coding patterns and achievements
+- **Cross-session Analytics**: Track progress across multiple coding sessions and projects
+- **Newsletter Delivery**: Receive weekly insights tailored to your unique coding style
+
+### 🔒 **Privacy & Control**
 - **Privacy-First Design**: All data stays local until you explicitly sign in and opt-in
-- **Smart Development Detection**: Automatically switches between development and production modes
-- **Activity Dashboard**: View your coding activity right in VS Code's sidebar
 - **Configurable & Lightweight**: Fine-tune settings to match your preferences
+- **Always Useful**: The activity panel provides valuable insights even without an account
 
 ## 📦 Installation
 
@@ -34,20 +45,33 @@ Personalized vibe-learning newsletter powered by your coding sessions — learn 
 
 ### Getting Started
 1. **Install the extension** - Frolic starts logging automatically (locally only)
-2. **Sign in** (optional) - Use Command Palette → `Frolic: Sign In` to enable personalized recaps
-3. **View activity** - Check the Frolic panel in VS Code's Explorer sidebar
+2. **View activity** - Check the Frolic panel in VS Code's Explorer sidebar for immediate insights
+3. **Optional: Sign in** - Use Command Palette → `Frolic: Sign In` to unlock personalized recaps and newsletter features
+
+### Without Sign-in
+Frolic provides valuable insights right away:
+- **Session metrics**: See your current coding session duration and activity
+- **File analytics**: Track which files and languages you're working with
+- **Event tracking**: Monitor your coding activity with visual indicators
+- **Local export**: Export your data anytime for personal analysis
+
+### With Sign-in
+Unlock additional features:
+- **Personalized newsletters**: AI-generated insights delivered to your inbox
+- **Advanced analytics**: Cross-session tracking and pattern recognition
+- **Smart digests**: Curated summaries of your coding achievements
 
 ### Commands
 - `Frolic: Sign In` - Connect to get personalized coding recaps
 - `Frolic: Send Digest Now` - Manually send your coding activity (requires sign-in)
-- `Frolic: Flush Logs` - Save activity data to local file
+- `Frolic: Flush Logs` - Export activity data to local `.frolic-log.json` file
 
 ## ⚙️ Configuration
 
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `frolic.enableLogging` | Enable/disable activity logging | `true` |
-| `frolic.apiBaseUrl` | API endpoint (auto-detects dev/prod) | `https://getfrolic.io` |
+| `frolic.apiBaseUrl` | API endpoint for Frolic services | `https://getfrolic.io` |
 | `frolic.digestFrequencyHours` | How often to send activity digests | `24` hours |
 | `frolic.maxBufferSize` | Maximum events to keep in memory | `10000` |
 | `frolic.maxMemoryMB` | Memory limit for activity buffer | `50` MB |
@@ -91,8 +115,8 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 
 ### Your Control
 - **Logging is optional** - Disable anytime with `frolic.enableLogging: false`
-- **Sign-in is optional** - Extension works locally without any account
-- **Data deletion** - Contact us anytime to delete your data
+- **Local-first design** - All data stays on your machine until you sign in
+- **Data deletion** - Contact us anytime to delete your cloud data
 - **Open source** - Extension code is public for full transparency
 
 ### Data Usage

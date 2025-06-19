@@ -105,10 +105,8 @@ function logEvent(eventType: string, data: any) {
         }
     }
 
-    // Only log in development to avoid logging potentially sensitive code content
-    if (isExtensionDevelopment()) {
-    console.log(`[FROLIC] ${eventType}`, entry);
-    }
+    // Debug logging (removed environment detection)
+    // console.log(`[FROLIC] ${eventType}`, entry);
 }
 
 function writeLogsToFile() {
@@ -133,16 +131,11 @@ function writeLogsToFile() {
 }
 
 function getApiBaseUrl(): string {
-  // Auto-detect development environment
-  const isDevelopment = isExtensionDevelopment();
-  
-  if (isDevelopment) {
-    console.log('[FROLIC] Development environment detected, using localhost');
-    return 'http://localhost:3000';
-  }
-  
   const config = vscode.workspace.getConfiguration('frolic');
   const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.io';
+  
+  // Debug: Log what URL we're using
+  console.log(`[FROLIC] getApiBaseUrl() returning: ${url}`);
   
   // Validate URL format
   try {
@@ -151,47 +144,6 @@ function getApiBaseUrl(): string {
   } catch {
     console.warn('[FROLIC] Invalid API URL in settings, using default');
     return 'https://getfrolic.io';
-  }
-}
-
-function isExtensionDevelopment(): boolean {
-  // Check if we're running in extension development mode
-  try {
-    // Method 1: Check if running from extension development host
-    if (extensionContext?.extensionMode === vscode.ExtensionMode.Development) {
-      return true;
-    }
-    
-    // Method 2: Check if we're in the workspace that contains package.json with our extension
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders) {
-      for (const folder of workspaceFolders) {
-        try {
-          const packagePath = path.join(folder.uri.fsPath, 'package.json');
-          if (fs.existsSync(packagePath)) {
-            const packageContent = fs.readFileSync(packagePath, 'utf8');
-            const packageJson = JSON.parse(packageContent);
-            // Check if this is our extension's package.json
-            if (packageJson.name === 'frolic' && packageJson.publisher === 'frolic') {
-              return true;
-            }
-          }
-        } catch (err) {
-          // Ignore errors reading package.json files
-        }
-      }
-    }
-    
-    // Method 3: Check extension installation path
-    if (extensionContext?.extensionPath && extensionContext.extensionPath.includes('/.vscode/extensions/') === false) {
-      // If not installed in standard extensions folder, likely development
-      return true;
-    }
-    
-    return false;
-  } catch (err) {
-    console.log('[FROLIC] Error detecting development environment:', err);
-    return false;
   }
 }
 
@@ -631,6 +583,9 @@ export async function signInCommand(context: vscode.ExtensionContext) {
     // Build auth URL
     const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
     
+    // Debug: Log the URL being used
+    console.log(`[FROLIC] Auth URL constructed: ${authUrl}`);
+    
     // Show initial progress message
     const progressResult = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
@@ -1033,6 +988,50 @@ export function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(sendDigestCmd);
 
+    // Register writeLogsToFile command
+    const writeLogsCmd = vscode.commands.registerCommand('frolic.writeLogsToFile', async () => {
+        writeLogsToFile();
+        vscode.window.showInformationMessage('✅ Frolic: Logs written to .frolic-log.json');
+    });
+    context.subscriptions.push(writeLogsCmd);
+
+    // Register refresh activity panel command
+    const refreshActivityPanelCmd = vscode.commands.registerCommand('frolic.refreshActivityPanel', () => {
+        if (activityProvider) {
+            activityProvider.refresh();
+            vscode.window.showInformationMessage('🔄 Frolic: Activity panel refreshed');
+        }
+    });
+    context.subscriptions.push(refreshActivityPanelCmd);
+
+    // Register sign-out command
+    const signOutCmd = vscode.commands.registerCommand('frolic.signOut', async () => {
+        try {
+            // Clear stored tokens
+            await context.secrets.delete('frolic.accessToken');
+            await context.secrets.delete('frolic.refreshToken');
+            
+            // Update status
+            updateStatusBar('unauthenticated');
+            
+            // Refresh activity panel to show updated auth status
+            if (activityProvider) {
+                activityProvider.refresh();
+            }
+            
+            vscode.window.showInformationMessage('👋 Signed out from Frolic. Your local activity tracking will continue.', 'Sign In Again')
+                .then(selection => {
+                    if (selection === 'Sign In Again') {
+                        vscode.commands.executeCommand('frolic.signIn');
+                    }
+                });
+        } catch (error) {
+            console.error('[FROLIC] Sign-out error:', error);
+            vscode.window.showErrorMessage('Failed to sign out. Please try again.');
+        }
+    });
+    context.subscriptions.push(signOutCmd);
+
     // Start daily digest sending
     startPeriodicDigestSending(context);
 
@@ -1221,8 +1220,11 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
 class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<FrolicTreeItem | undefined | null | void> = new vscode.EventEmitter<FrolicTreeItem | undefined | null | void>();
     readonly onDidChangeTreeData: vscode.Event<FrolicTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
+    private sessionStartTime: Date;
     
-    constructor(private context: vscode.ExtensionContext) {}
+    constructor(private context: vscode.ExtensionContext) {
+        this.sessionStartTime = new Date();
+    }
 
     refresh(): void {
         this._onDidChangeTreeData.fire();
@@ -1234,76 +1236,202 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
 
     getChildren(element?: FrolicTreeItem): Thenable<FrolicTreeItem[]> {
         if (!element) {
-            // Root level items
+            // Root level items with enhanced metrics
             const items: FrolicTreeItem[] = [];
             
-            // Session info with custom Frolic logo
+            // Enhanced session header with logo
             const logoPath = vscode.Uri.file(path.join(this.context.extensionPath, 'images', 'frolic_logo.png'));
+            const sessionDuration = Math.round((Date.now() - this.sessionStartTime.getTime()) / 1000 / 60);
             items.push(new FrolicTreeItem(
-                `Session: ${LOG_BUFFER.length} events`,
+                `Frolic Session • ${sessionDuration}m`,
                 vscode.TreeItemCollapsibleState.None,
-                'session-info',
+                'session-header',
                 undefined,
                 logoPath
+            ));
+
+            // Authentication status section (NEW)
+            items.push(new FrolicTreeItem(
+                '🔐 Account Status',
+                vscode.TreeItemCollapsibleState.Expanded,
+                'auth-status'
+            ));
+
+            // Live stats section
+            items.push(new FrolicTreeItem(
+                '⚡ Live Stats',
+                vscode.TreeItemCollapsibleState.Expanded,
+                'live-stats'
+            ));
+
+            // Session overview
+            items.push(new FrolicTreeItem(
+                '📊 Session Overview',
+                vscode.TreeItemCollapsibleState.Expanded,
+                'session-overview'
             ));
 
             // Active files
             const activeFiles = this.getActiveFiles();
             if (activeFiles.length > 0) {
                 items.push(new FrolicTreeItem(
-                    `📄 Active Files (${activeFiles.length})`,
-                    vscode.TreeItemCollapsibleState.Collapsed,
+                    `📁 Top Files (${activeFiles.length})`,
+                    vscode.TreeItemCollapsibleState.Expanded,
                     'active-files'
                 ));
             }
 
-            // Actions
+            // Insights
             items.push(new FrolicTreeItem(
-                '⚙️ Actions',
-                vscode.TreeItemCollapsibleState.Collapsed,
+                '💡 Insights',
+                vscode.TreeItemCollapsibleState.Expanded,
+                'insights'
+            ));
+
+            // Quick actions
+            items.push(new FrolicTreeItem(
+                '🚀 Quick Actions',
+                vscode.TreeItemCollapsibleState.Expanded,
                 'actions'
             ));
 
             return Promise.resolve(items);
-        } else if (element.contextValue === 'active-files') {
-            // Show active files
-            const activeFiles = this.getActiveFiles();
-            return Promise.resolve(activeFiles.map(file => 
-                new FrolicTreeItem(
-                    `📄 ${file.name} (${file.count})`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'file-item'
-                )
-            ));
-        } else if (element.contextValue === 'actions') {
-            // Show action items
+        } 
+        
+        else if (element.contextValue === 'auth-status') {
+            return this.getAuthStatusItems();
+        }
+        
+        else if (element.contextValue === 'live-stats') {
+            const recentActivity = this.getRecentActivity();
+            const codingVelocity = this.getCodingVelocity();
+            const bufferMemoryMB = (bufferMemoryUsage / 1024 / 1024).toFixed(1);
+            
             return Promise.resolve([
                 new FrolicTreeItem(
-                    '🚀 Send Digest Now',
+                    `🔥 Recent: ${recentActivity} edits/5m`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'live-stat',
+                    undefined,
+                    new vscode.ThemeIcon('flame')
+                ),
+                new FrolicTreeItem(
+                    `⚡ Velocity: ${codingVelocity}/min`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'live-stat',
+                    undefined,
+                    new vscode.ThemeIcon('pulse')
+                ),
+                new FrolicTreeItem(
+                    `💾 Buffer: ${bufferMemoryMB}MB`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'live-stat',
+                    undefined,
+                    new vscode.ThemeIcon('database')
+                )
+            ]);
+        }
+        
+        else if (element.contextValue === 'session-overview') {
+            const totalEvents = LOG_BUFFER.length;
+            const filesEdited = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
+            const totalLines = this.getTotalLinesChanged();
+            const aiInsertions = this.getAIInsertions();
+
+            return Promise.resolve([
+                new FrolicTreeItem(
+                    `📝 Events: ${totalEvents}`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'overview-stat',
+                    undefined,
+                    new vscode.ThemeIcon('symbol-event')
+                ),
+                new FrolicTreeItem(
+                    `📁 Files: ${filesEdited}`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'overview-stat',
+                    undefined,
+                    new vscode.ThemeIcon('file')
+                ),
+                new FrolicTreeItem(
+                    `📏 Lines: +${totalLines}`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'overview-stat',
+                    undefined,
+                    new vscode.ThemeIcon('add')
+                ),
+                new FrolicTreeItem(
+                    `🤖 AI Assists: ${aiInsertions}`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'overview-stat',
+                    undefined,
+                    new vscode.ThemeIcon('robot')
+                )
+            ]);
+        }
+        
+        else if (element.contextValue === 'active-files') {
+            const activeFiles = this.getActiveFiles();
+            return Promise.resolve(activeFiles.map(file => {
+                const fileIcon = this.getFileIcon(file.fullPath);
+                return new FrolicTreeItem(
+                    `${fileIcon} ${file.name} (${file.count})`,
+                    vscode.TreeItemCollapsibleState.None,
+                    'file-item',
+                    {
+                        command: 'vscode.open',
+                        title: 'Open File',
+                        arguments: [vscode.Uri.file(path.resolve(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', file.fullPath))]
+                    }
+                );
+            }));
+        }
+        
+        else if (element.contextValue === 'insights') {
+            const insights = this.generateInsights();
+            return Promise.resolve(insights.map(insight => 
+                new FrolicTreeItem(
+                    insight,
+                    vscode.TreeItemCollapsibleState.None,
+                    'insight',
+                    undefined,
+                    new vscode.ThemeIcon('lightbulb')
+                )
+            ));
+        }
+        
+        else if (element.contextValue === 'actions') {
+            const digestReady = LOG_BUFFER.length >= 10;
+            return Promise.resolve([
+                new FrolicTreeItem(
+                    digestReady ? '📤 Send Digest (Ready!)' : `📤 Send Digest (${LOG_BUFFER.length}/10)`,
                     vscode.TreeItemCollapsibleState.None,
                     'action-send-digest',
                     {
                         command: 'frolic.sendDigest',
                         title: 'Send Digest Now'
-                    }
+                    },
+                    new vscode.ThemeIcon(digestReady ? 'cloud-upload' : 'clock')
                 ),
                 new FrolicTreeItem(
-                    '💾 Flush Logs',
+                    '📝 Write Logs to File',
                     vscode.TreeItemCollapsibleState.None,
-                    'action-flush-logs',
+                    'action-write-logs',
                     {
-                        command: 'frolic.flushLogs',
-                        title: 'Flush Logs'
-                    }
+                        command: 'frolic.writeLogsToFile',
+                        title: 'Write Logs'
+                    },
+                    new vscode.ThemeIcon('save')
                 ),
                 new FrolicTreeItem(
-                    '🔐 Sign In',
+                    '🔄 Refresh Panel',
                     vscode.TreeItemCollapsibleState.None,
-                    'action-sign-in',
+                    'action-refresh',
                     {
-                        command: 'frolic.signIn',
-                        title: 'Sign In'
-                    }
+                        command: 'frolic.refreshActivityPanel',
+                        title: 'Refresh Panel'
+                    },
+                    new vscode.ThemeIcon('refresh')
                 )
             ]);
         }
@@ -1311,7 +1439,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         return Promise.resolve([]);
     }
 
-    private getActiveFiles(): {name: string, count: number}[] {
+    private getActiveFiles(): {name: string, fullPath: string, count: number}[] {
         const fileActivity: {[key: string]: number} = {};
         
         LOG_BUFFER.forEach(entry => {
@@ -1321,12 +1449,136 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         });
 
         return Object.entries(fileActivity)
-            .map(([path, count]) => ({
-                name: path.split('/').pop() || path,
+            .map(([fullPath, count]) => ({
+                name: fullPath.split('/').pop() || fullPath,
+                fullPath,
                 count
             }))
             .sort((a, b) => b.count - a.count)
             .slice(0, 5); // Show top 5 most active files
+    }
+
+    private getRecentActivity(): number {
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        return LOG_BUFFER.filter(event => 
+            event.eventType === 'file_edit' && 
+            new Date(event.timestamp).getTime() > fiveMinutesAgo
+        ).length;
+    }
+
+    private getCodingVelocity(): string {
+        const sessionDurationMinutes = (Date.now() - this.sessionStartTime.getTime()) / 1000 / 60;
+        if (sessionDurationMinutes < 1) return '0 lines';
+        
+        const totalLines = this.getTotalLinesChanged();
+        const velocity = Math.round((totalLines / sessionDurationMinutes) * 10) / 10;
+        
+        return `${velocity} lines`;
+    }
+
+    private getTotalLinesChanged(): number {
+        return LOG_BUFFER
+            .filter(e => e.eventType === 'file_edit')
+            .reduce((sum, e) => sum + (e.changes?.reduce((s: number, c: any) => s + Math.abs(c.lineCountDelta || 0), 0) || 0), 0);
+    }
+
+    private getAIInsertions(): number {
+        return LOG_BUFFER
+            .filter(e => e.eventType === 'file_edit')
+            .reduce((sum, e) => sum + (e.changes?.filter((c: any) => c.likelyAI).length || 0), 0);
+    }
+
+    private generateInsights(): string[] {
+        const insights: string[] = [];
+        const languages = this.getLanguageStats();
+        const topLanguage = Object.entries(languages).sort((a, b) => b[1] - a[1])[0];
+        
+        if (topLanguage) {
+            insights.push(`🎯 Focus: ${topLanguage[0]} (${topLanguage[1]} edits)`);
+        }
+        
+        const sessionDuration = (Date.now() - this.sessionStartTime.getTime()) / 1000 / 60;
+        if (sessionDuration > 30) {
+            insights.push(`🔥 Deep focus: ${Math.round(sessionDuration)}m session`);
+        }
+        
+        const aiAssists = this.getAIInsertions();
+        if (aiAssists === 0 && LOG_BUFFER.length > 10) {
+            insights.push('💪 Independent coding streak!');
+        } else if (aiAssists > 0) {
+            insights.push(`🤖 AI-assisted development (${aiAssists})`);
+        }
+        
+        const uniqueFiles = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
+        if (uniqueFiles > 5) {
+            insights.push(`🌐 Multi-file project (${uniqueFiles} files)`);
+        }
+        
+        const recentActivity = this.getRecentActivity();
+        if (recentActivity > 10) {
+            insights.push('🚀 High activity period!');
+        }
+        
+        if (insights.length === 0) {
+            insights.push('✨ Keep coding to see insights!');
+        }
+        
+        return insights.slice(0, 3); // Max 3 insights to avoid clutter
+    }
+
+    private getLanguageStats(): {[key: string]: number} {
+        const languages: {[key: string]: number} = {};
+        LOG_BUFFER.forEach(event => {
+            if (event.eventType === 'file_edit' && event.language && event.language !== 'unknown') {
+                const lang = this.formatLanguageName(event.language);
+                languages[lang] = (languages[lang] || 0) + 1;
+            }
+        });
+        return languages;
+    }
+
+    private formatLanguageName(language: string): string {
+        const langMap: {[key: string]: string} = {
+            'typescriptreact': 'TypeScript React',
+            'javascriptreact': 'JavaScript React',
+            'typescript': 'TypeScript',
+            'javascript': 'JavaScript',
+            'python': 'Python',
+            'java': 'Java',
+            'cpp': 'C++',
+            'csharp': 'C#'
+        };
+        return langMap[language] || language;
+    }
+
+    private getFileIcon(filename: string): string {
+        const ext = filename.split('.').pop()?.toLowerCase();
+        const iconMap: {[key: string]: string} = {
+            'ts': '🟦', 'tsx': '⚛️', 'js': '🟨', 'jsx': '⚛️',
+            'py': '🐍', 'java': '☕', 'cpp': '⚙️', 'c': '⚙️', 'cs': '💜',
+            'html': '🌐', 'css': '🎨', 'scss': '🎨', 'sass': '🎨',
+            'json': '📋', 'md': '📝', 'txt': '📄', 'yml': '🔧', 'yaml': '🔧',
+            'go': '🐹', 'rs': '🦀', 'php': '🐘', 'rb': '💎'
+        };
+        return iconMap[ext || ''] || '📄';
+    }
+
+    private async getAuthStatusItems(): Promise<FrolicTreeItem[]> {
+        const accessToken = await getValidAccessToken(this.context);
+        const status = accessToken ? 'authenticated' : 'unauthenticated';
+        const label = status === 'authenticated' ? `✅ Signed in` : '❌ Not signed in';
+        return [
+            new FrolicTreeItem(
+                label,
+                vscode.TreeItemCollapsibleState.None,
+                'auth-item',
+                {
+                    command: status === 'authenticated' ? 'frolic.signOut' : 'frolic.signIn',
+                    title: status === 'authenticated' ? 'Sign Out' : 'Sign In'
+                },
+                new vscode.ThemeIcon(status === 'authenticated' ? 'account' : 'sign-in')
+            )
+        ];
     }
 }
 
