@@ -181,6 +181,10 @@ function generateCodeChallenge(verifier: string): string {
   return base64URLEncode(crypto.createHash('sha256').update(verifier).digest());
 }
 
+// Track ongoing refresh attempts to prevent race conditions
+let isRefreshing = false;
+let refreshPromise: Promise<string | null> | null = null;
+
 /**
  * Get a valid access token, refreshing it if necessary
  */
@@ -192,7 +196,7 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   if (!accessToken) {
     if (refreshToken) {
       console.log('[FROLIC] No access token but refresh token exists, attempting refresh');
-      return await refreshAccessToken(context, refreshToken);
+      return await performTokenRefresh(context, refreshToken);
     }
     return null;
   }
@@ -201,7 +205,7 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   if (isTokenExpired(accessToken)) {
     console.log('[FROLIC] Access token is expired, attempting refresh');
     if (refreshToken) {
-      return await refreshAccessToken(context, refreshToken);
+      return await performTokenRefresh(context, refreshToken);
     } else {
       console.log('[FROLIC] No refresh token available, user needs to re-authenticate');
       await context.secrets.delete('frolic.accessToken');
@@ -210,6 +214,42 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   }
   
   return accessToken;
+}
+
+/**
+ * Perform token refresh with race condition protection
+ */
+async function performTokenRefresh(context: vscode.ExtensionContext, refreshToken: string): Promise<string | null> {
+  // If already refreshing, wait for the existing refresh to complete
+  if (isRefreshing && refreshPromise) {
+    console.log('[FROLIC] Token refresh already in progress, waiting...');
+    return await refreshPromise;
+  }
+  
+  // Start new refresh
+  isRefreshing = true;
+  refreshPromise = refreshAccessToken(context, refreshToken);
+  
+  try {
+    const result = await refreshPromise;
+    return result;
+  } finally {
+    isRefreshing = false;
+    refreshPromise = null;
+  }
+}
+
+/**
+ * Clear all authentication tokens and reset auth state
+ */
+async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<void> {
+  console.log('[FROLIC] Clearing all authentication tokens');
+  await context.secrets.delete('frolic.accessToken');
+  await context.secrets.delete('frolic.refreshToken');
+  
+  // Reset any ongoing refresh state
+  isRefreshing = false;
+  refreshPromise = null;
 }
 
 /**
@@ -228,6 +268,27 @@ function isTokenExpired(token: string): boolean {
   } catch (err) {
     console.log('[FROLIC] Error checking token expiration:', err);
     return true; // Assume expired if we can't parse
+  }
+}
+
+/**
+ * Get token expiration time for debugging
+ */
+function getTokenExpirationTime(token: string): string {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return 'Invalid token format';
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    if (!payload.exp) return 'No expiration time';
+    
+    const expDate = new Date(payload.exp * 1000);
+    const now = new Date();
+    const diffMinutes = Math.round((expDate.getTime() - now.getTime()) / 1000 / 60);
+    
+    return `${expDate.toISOString()} (${diffMinutes > 0 ? `${diffMinutes}m remaining` : `expired ${Math.abs(diffMinutes)}m ago`})`;
+  } catch (err) {
+    return 'Could not parse token';
   }
 }
 
@@ -264,11 +325,29 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
     }
     
     const data = await response.json();
+    console.log('[FROLIC] Refresh response keys:', Object.keys(data));
     const newAccessToken = data.accessToken || data.access_token;
     const newRefreshToken = data.refresh_token; // Some systems rotate refresh tokens
     
     if (!newAccessToken) {
       console.log('[FROLIC] No access token in refresh response');
+      console.log('[FROLIC] Response data:', data);
+      return null;
+    }
+    
+    console.log(`[FROLIC] Got new access token: ${newAccessToken.substring(0, 30)}...`);
+    if (newRefreshToken) {
+      console.log('[FROLIC] Got new refresh token (rotated)');
+    } else {
+      console.log('[FROLIC] No new refresh token (not rotated)');
+    }
+    
+    // Validate the new token before storing it
+    if (isTokenExpired(newAccessToken)) {
+      console.log('[FROLIC] Refreshed token is already expired! Server issue?');
+      await context.secrets.delete('frolic.accessToken');
+      await context.secrets.delete('frolic.refreshToken');
+      updateStatusBar('unauthenticated');
       return null;
     }
     
@@ -278,7 +357,7 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
       await context.secrets.store('frolic.refreshToken', newRefreshToken);
     }
     
-    console.log('[FROLIC] Access token refreshed successfully');
+    console.log('[FROLIC] Access token refreshed and validated successfully');
     updateStatusBar('authenticated');
     return newAccessToken;
     
@@ -312,6 +391,7 @@ export async function sendDigestToBackend(
   }
 
   console.log(`[FROLIC] Using access token: ${accessToken?.substring(0, 20)}...`); // Debug log
+  console.log(`[FROLIC] Token expires at: ${getTokenExpirationTime(accessToken)}`); // Debug token expiry
 
   try {
     const res = await fetchWithTimeout(apiUrl, {
@@ -329,11 +409,63 @@ export async function sendDigestToBackend(
       
       // Handle specific HTTP status codes
       if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
-        // Token expired - clear it and update status
+        // Token expired - clear it and try to refresh
         await context.secrets.delete('frolic.accessToken');
         console.log('[FROLIC] Token expired, cleared stored token');
-        updateStatusBar('unauthenticated');
-        throw new Error('AUTH_TOKEN_EXPIRED');
+        
+        // Try to refresh token and retry the request once
+        const newToken = await getValidAccessToken(context);
+        if (newToken && newToken !== accessToken) { // Ensure we got a different token
+          console.log('[FROLIC] Token refreshed, retrying digest upload...');
+          console.log(`[FROLIC] Old token: ${accessToken.substring(0, 30)}...`);
+          console.log(`[FROLIC] New token: ${newToken.substring(0, 30)}...`);
+          console.log(`[FROLIC] New token expires: ${getTokenExpirationTime(newToken)}`);
+          // Retry the request with new token
+          const retryRes = await fetchWithTimeout(apiUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${newToken}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+            },
+            body: JSON.stringify({ sessionId, digest })
+          }, 30000);
+          
+          if (retryRes.ok) {
+            console.log('[FROLIC] Digest uploaded successfully after token refresh');
+            return await retryRes.json();
+          } else {
+            const retryErrorText = await retryRes.text();
+            console.log(`[FROLIC] Retry after token refresh failed: ${retryRes.status} ${retryErrorText}`);
+            
+            // If the refreshed token also fails, clear everything and force re-authentication
+            if (retryRes.status === 401) {
+              console.log('[FROLIC] Refreshed token also rejected - clearing all auth state');
+              await clearAllAuthTokens(context);
+              updateStatusBar('unauthenticated');
+              
+              // Automatically prompt user to re-authenticate
+              const selection = await vscode.window.showWarningMessage(
+                '🔐 Frolic: Authentication expired. Please sign in again to continue sending digests.',
+                'Sign In Now',
+                'Later'
+              );
+              
+              if (selection === 'Sign In Now') {
+                // Small delay to ensure UI is ready
+                setTimeout(() => {
+                  vscode.commands.executeCommand('frolic.signIn');
+                }, 500);
+              }
+            }
+            throw new Error('AUTH_TOKEN_EXPIRED');
+          }
+        } else {
+          console.log('[FROLIC] Could not refresh token or got same token back');
+          await clearAllAuthTokens(context);
+          updateStatusBar('unauthenticated');
+          throw new Error('AUTH_TOKEN_EXPIRED');
+        }
       } else if (res.status === 403) {
         console.error('[FROLIC] Access forbidden - check API permissions');
         throw new Error('ACCESS_FORBIDDEN');
@@ -972,12 +1104,34 @@ export function activate(context: vscode.ExtensionContext) {
 
         try {
             const eventCount = await sendDigestImmediately(context);
-            vscode.window.showInformationMessage(`✅ Frolic: Digest sent successfully! (${eventCount} events processed)`);
+            if (eventCount > 0) {
+                vscode.window.showInformationMessage(`✅ Frolic: Digest sent successfully! (${eventCount} events processed)`);
+            } else {
+                // Check authentication status to provide better error message
+                const accessToken = await getValidAccessToken(context);
+                if (!accessToken) {
+                    vscode.window.showWarningMessage('🔐 Frolic: Please sign in first to send digests', 'Sign In')
+                        .then(selection => {
+                            if (selection === 'Sign In') {
+                                vscode.commands.executeCommand('frolic.signIn');
+                            }
+                        });
+                } else {
+                    vscode.window.showErrorMessage('❌ Frolic: Failed to send digest. Please try again or check your connection.', 'Retry');
+                }
+            }
         } catch (err: any) {
             if (err.message === 'NO_AUTH_TOKEN') {
                 vscode.window.showWarningMessage('🔐 Frolic: Please sign in first to send digests', 'Sign In')
                     .then(selection => {
                         if (selection === 'Sign In') {
+                            vscode.commands.executeCommand('frolic.signIn');
+                        }
+                    });
+            } else if (err.message === 'AUTH_TOKEN_EXPIRED') {
+                vscode.window.showWarningMessage('🔐 Frolic: Authentication expired. Your events are preserved and will be sent after re-authentication.', 'Sign In Now')
+                    .then(selection => {
+                        if (selection === 'Sign In Now') {
                             vscode.commands.executeCommand('frolic.signIn');
                         }
                     });
@@ -1007,9 +1161,8 @@ export function activate(context: vscode.ExtensionContext) {
     // Register sign-out command
     const signOutCmd = vscode.commands.registerCommand('frolic.signOut', async () => {
         try {
-            // Clear stored tokens
-            await context.secrets.delete('frolic.accessToken');
-            await context.secrets.delete('frolic.refreshToken');
+            // Clear all auth tokens and reset state
+            await clearAllAuthTokens(context);
             
             // Update status
             updateStatusBar('unauthenticated');
@@ -1117,6 +1270,7 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
     if (LOG_BUFFER.length > 0) {
         const eventCount = LOG_BUFFER.length; // Capture count before clearing
         console.log(`[FROLIC] Sending digest with ${eventCount} events`);
+        console.log(`[FROLIC] Sample events:`, LOG_BUFFER.slice(0, 3)); // Show first 3 events for debugging
         updateStatusBar('sending');
         
         const digest = analyzeLogs(LOG_BUFFER);
@@ -1141,10 +1295,12 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 // Handle different error types
                 if (err.message === 'NO_AUTH_TOKEN' || err.message === 'AUTH_TOKEN_EXPIRED') {
                     // Auth errors - don't retry, update status
+                    console.log(`[FROLIC] Authentication error: ${err.message}. Buffer not cleared (${eventCount} events preserved).`);
                     updateStatusBar('unauthenticated');
                     return 0; // Exit without clearing buffer
                 } else if (err.message === 'ACCESS_FORBIDDEN' || err.message === 'CLIENT_ERROR') {
                     // Client errors - don't retry
+                    console.log(`[FROLIC] Client error: ${err.message}. Buffer not cleared (${eventCount} events preserved).`);
                     updateStatusBar('error');
                     return 0; // Exit without clearing buffer
                 }
