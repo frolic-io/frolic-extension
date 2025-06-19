@@ -56,6 +56,10 @@
       {
         "command": "frolic.sendDigest",
         "title": "Frolic: Send Digest Now"
+      },
+      {
+        "command": "frolic.showWelcome",
+        "title": "Frolic: Show Welcome Guide"
       }
     ],
     "configuration": {
@@ -116,7 +120,46 @@
           "when": "frolic.showActivityView"
         }
       ]
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "frolic.welcome",
+        "title": "Welcome to Frolic",
+        "description": "Get started with personalized coding insights and recaps",
+        "steps": [
+          {
+            "id": "frolic.welcome.intro",
+            "title": "Welcome to Frolic!",
+            "description": "Frolic passively tracks your coding activity to provide personalized insights and learning recaps. Let's get you set up!\n\n[Open Frolic Activity Panel](command:frolic-activity.focus)",
+            "media": {
+              "image": "images/frolic_logo.png",
+              "altText": "Frolic logo"
+            }
+          },
+          {
+            "id": "frolic.welcome.signin",
+            "title": "Sign In to Enable Cloud Sync",
+            "description": "Sign in to sync your coding activity and receive personalized recaps via email.\n\n[Sign In to Frolic](command:frolic.signIn)\n\n*Note: Frolic works locally without signing in, but you'll miss out on personalized insights and recaps.*",
+            "media": {
+              "image": "images/frolic_logo.png", 
+              "altText": "Sign in to Frolic"
+            },
+            "completionEvents": [
+              "onCommand:frolic.signIn"
+            ]
+          },
+          {
+            "id": "frolic.welcome.complete",
+            "title": "You're All Set!",
+            "description": "Frolic is now tracking your coding activity. Check the Frolic Activity panel in the Explorer to see your progress.\n\n**Next steps:**\n- Start coding to see activity tracking\n- Check your email for personalized recaps\n- Explore settings with `Frolic:` in the Command Palette\n\n[Send Test Digest](command:frolic.sendDigest)",
+            "media": {
+              "image": "images/frolic_logo.png",
+              "altText": "Frolic setup complete"
+            }
+          }
+        ]
+      }
+    ]
   },
   "dependencies": {
     "@types/node-fetch": "^2.6.12",

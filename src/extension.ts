@@ -606,77 +606,250 @@ function analyzeLogs(logs: any[]): any {
 // Removed all helper functions - analysis now done by backend
 
 export async function signInCommand(context: vscode.ExtensionContext) {
-  const state = uuidv4();
-  const codeVerifier = generateCodeVerifier();
-  const codeChallenge = generateCodeChallenge(codeVerifier);
-  const apiBaseUrl = getApiBaseUrl();
+  console.log('[FROLIC] Starting enhanced sign-in flow...');
   
-  // Get token expiration preference
-  const config = vscode.workspace.getConfiguration('frolic');
-  const tokenExpiration = config.get<string>('tokenExpiration', 'long');
+  // Show loading state
+  updateStatusBar('initializing');
   
-  const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
-  vscode.env.openExternal(vscode.Uri.parse(authUrl));
-
-  // Store the codeVerifier in SecretStorage for later token exchange
-  await context.secrets.store('frolic.codeVerifier', codeVerifier);
-  await context.secrets.store('frolic.state', state);
-
-  const code = await vscode.window.showInputBox({
-    prompt: 'Paste the code from the Frolic login page here',
-    ignoreFocusOut: true
-  });
-  if (!code) {
-    vscode.window.showWarningMessage('Frolic sign-in cancelled - no code entered');
-    return;
-  }
-
   try {
-    // Retrieve the codeVerifier and state
-    const storedCodeVerifier = await context.secrets.get('frolic.codeVerifier');
-    const storedState = await context.secrets.get('frolic.state');
+    // Generate PKCE parameters
+    const state = uuidv4();
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallenge(codeVerifier);
+    const apiBaseUrl = getApiBaseUrl();
     
     // Get token expiration preference
     const config = vscode.workspace.getConfiguration('frolic');
     const tokenExpiration = config.get<string>('tokenExpiration', 'long');
     
-    const res = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/token`, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
-      },
-      body: JSON.stringify({ 
-        code, 
-        state: storedState, 
-        code_verifier: storedCodeVerifier,
-        token_type: tokenExpiration
-      })
-    }, 15000); // 15 second timeout for auth
-    if (!res.ok) {
-      const errorText = await res.text();
-      vscode.window.showErrorMessage(`🔐 Frolic sign-in failed: Invalid code or expired session`, 'Try Again');
-      console.error(`[FROLIC] Sign-in failed: ${res.status} ${errorText}`);
-      return;
-    }
-    const data = await res.json();
-    const accessToken = data.accessToken || data.access_token;
-    const refreshToken = data.refresh_token;
+    // Store PKCE parameters securely
+    await context.secrets.store('frolic.codeVerifier', codeVerifier);
+    await context.secrets.store('frolic.state', state);
     
-    // Store both tokens
-    await context.secrets.store('frolic.accessToken', accessToken);
-    if (refreshToken) {
-      await context.secrets.store('frolic.refreshToken', refreshToken);
-      console.log('[FROLIC] Stored both access and refresh tokens');
-    } else {
-      console.log('[FROLIC] Only access token received (no refresh token)');
-    }
+    // Build auth URL
+    const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
     
+    // Show initial progress message
+    const progressResult = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: "Frolic Sign-In",
+      cancellable: true
+    }, async (progress, token) => {
+      
+      progress.report({ message: "Opening browser for authentication..." });
+      
+      // Open browser
+      const opened = await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+      if (!opened) {
+        throw new Error('Failed to open browser');
+      }
+      
+      progress.report({ message: "Waiting for authentication code..." });
+      
+      // Wait a moment for the browser to open
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Check if cancelled
+      if (token.isCancellationRequested) {
+        throw new Error('Sign-in cancelled by user');
+      }
+      
+      // Prompt for code with enhanced UX
+      const code = await vscode.window.showInputBox({
+        title: 'Frolic Authentication',
+        prompt: 'Paste the authentication code from your browser',
+        placeHolder: 'e.g., abc123def456...',
+        ignoreFocusOut: true,
+        validateInput: (value) => {
+          if (!value || value.trim().length === 0) {
+            return 'Please enter the authentication code';
+          }
+          if (value.trim().length < 10) {
+            return 'Authentication code seems too short';
+          }
+          return null;
+        }
+      });
+      
+      if (!code) {
+        throw new Error('No authentication code provided');
+      }
+      
+      progress.report({ message: "Exchanging code for tokens..." });
+      
+      // Exchange code for tokens
+      const storedCodeVerifier = await context.secrets.get('frolic.codeVerifier');
+      const storedState = await context.secrets.get('frolic.state');
+      
+      const tokenResponse = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/token`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'User-Agent': 'VSCode-Frolic-Extension/1.0.3'
+        },
+        body: JSON.stringify({ 
+          code: code.trim(), 
+          state: storedState, 
+          code_verifier: storedCodeVerifier,
+          token_type: tokenExpiration
+        })
+      }, 15000);
+      
+      if (!tokenResponse.ok) {
+        const errorText = await tokenResponse.text();
+        console.error(`[FROLIC] Token exchange failed: ${tokenResponse.status} ${errorText}`);
+        
+        if (tokenResponse.status === 400) {
+          throw new Error('Invalid or expired authentication code. Please try again.');
+        } else if (tokenResponse.status === 401) {
+          throw new Error('Authentication failed. Please try again.');
+        } else {
+          throw new Error(`Authentication server error (${tokenResponse.status}). Please try again later.`);
+        }
+      }
+      
+      const tokenData = await tokenResponse.json();
+      const accessToken = tokenData.accessToken || tokenData.access_token;
+      const refreshToken = tokenData.refresh_token;
+      
+      if (!accessToken) {
+        throw new Error('No access token received from server');
+      }
+      
+      progress.report({ message: "Saving authentication..." });
+      
+      // Store tokens securely
+      await context.secrets.store('frolic.accessToken', accessToken);
+      if (refreshToken) {
+        await context.secrets.store('frolic.refreshToken', refreshToken);
+        console.log('[FROLIC] Stored both access and refresh tokens');
+      } else {
+        console.log('[FROLIC] Only access token received (no refresh token)');
+      }
+      
+      // Clean up PKCE parameters
+      await context.secrets.delete('frolic.codeVerifier');
+      await context.secrets.delete('frolic.state');
+      
+      return { accessToken, refreshToken };
+    });
+    
+    // Success!
     updateStatusBar('authenticated');
-    vscode.window.showInformationMessage('🎉 Welcome to Frolic! Your coding activity will now be tracked for personalized recaps.');
-  } catch (err) {
-    vscode.window.showErrorMessage('🔐 Frolic sign-in failed: Network error', 'Retry');
-    console.error('[FROLIC] Sign-in error:', err);
+    
+    // Show success message with next steps
+    const action = await vscode.window.showInformationMessage(
+      '🎉 Successfully signed in to Frolic! Your coding activity will now be tracked for personalized recaps.',
+      'Send Test Digest',
+      'View Activity'
+    );
+    
+    if (action === 'Send Test Digest') {
+      vscode.commands.executeCommand('frolic.sendDigest');
+    } else if (action === 'View Activity') {
+      vscode.commands.executeCommand('frolic-activity.focus');
+    }
+    
+    console.log('[FROLIC] Sign-in completed successfully');
+    
+  } catch (error: any) {
+    console.error('[FROLIC] Sign-in error:', error);
+    
+    // Update status bar to show error or unauthenticated state
+    updateStatusBar('unauthenticated');
+    
+    // Clean up any stored PKCE parameters on error
+    await context.secrets.delete('frolic.codeVerifier');
+    await context.secrets.delete('frolic.state');
+    
+    // Show appropriate error message
+    let errorMessage = 'Sign-in failed: ';
+    if (error.message.includes('cancelled')) {
+      errorMessage += 'Sign-in was cancelled';
+    } else if (error.message.includes('network') || error.message.includes('fetch')) {
+      errorMessage += 'Network error. Please check your connection and try again.';
+    } else if (error.message.includes('browser')) {
+      errorMessage += 'Could not open browser. Please try again.';
+    } else {
+      errorMessage += error.message || 'Unknown error occurred';
+    }
+    
+    vscode.window.showErrorMessage(`🔐 Frolic: ${errorMessage}`, 'Try Again', 'Show Guide')
+      .then(selection => {
+        if (selection === 'Try Again') {
+          vscode.commands.executeCommand('frolic.signIn');
+        } else if (selection === 'Show Guide') {
+          vscode.commands.executeCommand('frolic.showWelcome');
+        }
+      });
+  }
+}
+
+/**
+ * Initialize comprehensive authentication flow with multiple sign-in triggers
+ */
+async function initializeAuthenticationFlow(context: vscode.ExtensionContext) {
+    try {
+        const accessToken = await context.secrets.get('frolic.accessToken');
+        const isFirstRun = context.globalState.get('frolic.hasEverRun', false);
+        const hasShownWelcome = context.globalState.get('frolic.hasShownWelcome', false);
+        
+        if (!accessToken) {
+            updateStatusBar('unauthenticated');
+            
+            // 1. FIRST-TIME ACTIVATION TRIGGER: Show walkthrough on first install
+            if (!isFirstRun) {
+                console.log('[FROLIC] First-time activation detected, showing welcome walkthrough');
+                context.globalState.update('frolic.hasEverRun', true);
+                
+                // Small delay to ensure VS Code is fully loaded
+                setTimeout(() => {
+                    vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+                }, 2000);
+                
+                return; // Don't show other prompts on first run
+            }
+            
+            // 2. ACTIVATION EVENT TRIGGER: Show welcome message for returning users
+            if (!hasShownWelcome) {
+                const response = await vscode.window.showInformationMessage(
+                    '🚀 Welcome to Frolic! Let\'s get you signed in to enable personalized coding recaps.',
+                    'Sign In',
+                    'Show Guide',
+                    'Not Now'
+                );
+                
+                if (response === 'Sign In') {
+                    vscode.commands.executeCommand('frolic.signIn');
+                } else if (response === 'Show Guide') {
+                    vscode.commands.executeCommand('frolic.showWelcome');
+                }
+                
+                context.globalState.update('frolic.hasShownWelcome', true);
+            }
+        } else {
+            // User is authenticated
+            updateStatusBar('authenticated');
+            
+            // Validate token and refresh if needed
+            const validToken = await getValidAccessToken(context);
+            if (!validToken) {
+                console.log('[FROLIC] Token validation failed, showing sign-in prompt');
+                updateStatusBar('unauthenticated');
+                
+                vscode.window.showWarningMessage(
+                    'Frolic: Your session has expired. Please sign in again.',
+                    'Sign In'
+                ).then(selection => {
+                    if (selection === 'Sign In') {
+                        vscode.commands.executeCommand('frolic.signIn');
+                    }
+                });
+            }
+        }
+    } catch (error) {
+        console.error('[FROLIC] Error during authentication flow initialization:', error);
+        updateStatusBar('error');
     }
 }
 
@@ -803,6 +976,12 @@ export function activate(context: vscode.ExtensionContext) {
     const signInCmd = vscode.commands.registerCommand('frolic.signIn', () => signInCommand(context));
     context.subscriptions.push(signInCmd);
 
+    // Register welcome walkthrough command
+    const showWelcomeCmd = vscode.commands.registerCommand('frolic.showWelcome', () => {
+        vscode.commands.executeCommand('workbench.action.openWalkthrough', 'frolic.frolic#frolic.welcome');
+    });
+    context.subscriptions.push(showWelcomeCmd);
+
     // Register dedicated digest send command for testing
     const sendDigestCmd = vscode.commands.registerCommand('frolic.sendDigest', async () => {
         if (LOG_BUFFER.length === 0) {
@@ -831,28 +1010,8 @@ export function activate(context: vscode.ExtensionContext) {
     // Start daily digest sending
     startPeriodicDigestSending(context);
 
-    // On activation, check for token
-    context.secrets.get('frolic.accessToken').then(accessToken => {
-        if (!accessToken) {
-            updateStatusBar('unauthenticated');
-            // Show welcome message only once per session, not every activation
-            const hasShownWelcome = context.globalState.get('frolic.hasShownWelcome', false);
-            if (!hasShownWelcome) {
-                vscode.window.showInformationMessage(
-                    '🚀 Frolic: Get personalized coding recaps and insights',
-                    'Sign In',
-                    'Not Now'
-                ).then(selection => {
-                    if (selection === 'Sign In') {
-                        vscode.commands.executeCommand('frolic.signIn');
-                    }
-                    context.globalState.update('frolic.hasShownWelcome', true);
-                });
-            }
-        } else {
-            updateStatusBar('authenticated');
-        }
-    });
+    // Enhanced activation with multiple sign-in triggers
+    initializeAuthenticationFlow(context);
 }
 
 export function deactivate() {
@@ -1002,26 +1161,31 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             statusBarItem.text = '$(sync~spin) Frolic';
             statusBarItem.tooltip = 'Frolic is initializing...';
             statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = undefined;
             break;
         case 'authenticated':
             statusBarItem.text = `$(check) Frolic (${LOG_BUFFER.length})`;
             statusBarItem.tooltip = `Frolic: ${LOG_BUFFER.length} events logged. Click to flush.`;
             statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = 'frolic.flushLogs';
             break;
         case 'unauthenticated':
-            statusBarItem.text = '$(warning) Frolic';
-            statusBarItem.tooltip = 'Frolic: Sign in to enable cloud sync';
+            statusBarItem.text = '$(sign-in) Sign in to Frolic';
+            statusBarItem.tooltip = 'Frolic: Sign in to enable cloud sync and get personalized recaps';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            statusBarItem.command = 'frolic.signIn';
             break;
         case 'sending':
             statusBarItem.text = '$(cloud-upload) Frolic';
             statusBarItem.tooltip = 'Frolic: Sending digest...';
             statusBarItem.backgroundColor = undefined;
+            statusBarItem.command = undefined;
             break;
         case 'error':
             statusBarItem.text = '$(error) Frolic';
             statusBarItem.tooltip = 'Frolic: Connection error. Click to retry.';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+            statusBarItem.command = 'frolic.signIn';
             break;
     }
     statusBarItem.show();
