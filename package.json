@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Personalized vibe-learning newsletter powered by your coding sessions — learn from how you code, not just what you build.",
   "main": "./out/extension.js",
   "scripts": {
