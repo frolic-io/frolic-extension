@@ -4,7 +4,8 @@ import * as path from 'path';
 // Use crypto.randomUUID() instead of uuid package to avoid bundling issues
 // This is built into Node.js 15+ and VS Code runtime
 import * as crypto from 'crypto';
-const fetch = require('node-fetch');
+// Use built-in fetch instead of node-fetch to avoid bundling issues
+// Built-in fetch is available in Node.js 18+ and VS Code runtime
 
 const LOG_BUFFER: any[] = [];
 const MAX_CHANGE_TEXT_LENGTH = 2000; // Truncate very large code changes
