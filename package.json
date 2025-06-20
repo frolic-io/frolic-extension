@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.10",
+  "version": "1.0.15",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {
@@ -117,6 +117,13 @@
           "minimum": 10,
           "maximum": 200,
           "description": "Maximum memory usage for activity buffer in MB. Buffer will be trimmed if this limit is exceeded."
+        },
+        "frolic.notificationFrequencyHours": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0.5,
+          "maximum": 24,
+          "description": "How often to show digest success notifications (in hours). Set to 0.5 for frequent notifications, 24 for daily. Default is 2 hours."
         },
         "frolic.tokenExpiration": {
           "type": "string",
