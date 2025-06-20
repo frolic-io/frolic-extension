@@ -35,6 +35,10 @@ const QUICK_FIX_THRESHOLD = 5; // Backup after 5 events if 2+ minutes since last
 let lastNotificationTime = 0;
 let digestsSentSinceLastNotification = 0;
 
+// 🔄 ENHANCED: Background token refresh management
+let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
+const TOKEN_REFRESH_CHECK_INTERVAL = 30 * 60 * 1000; // Check every 30 minutes
+
 function getNotificationThrottleMs(): number {
     const config = vscode.workspace.getConfiguration('frolic');
     const hours = config.get<number>('notificationFrequencyHours', 2);
@@ -810,6 +814,9 @@ async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<voi
   // Reset any ongoing refresh state
   isRefreshing = false;
   refreshPromise = null;
+  
+  // 🔄 ENHANCED: Stop background token refresh when clearing tokens
+  stopBackgroundTokenRefresh();
 }
 
 /**
@@ -832,6 +839,9 @@ function isTokenExpired(token: string): boolean {
     }
     
     const timeUntilExpiry = payload.exp - now;
+    // 🔄 ENHANCED: Proactive refresh 1 hour before expiration
+    const PROACTIVE_REFRESH_BUFFER = 60 * 60; // 1 hour in seconds
+    const needsRefresh = timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER;
     const isExpired = payload.exp < now;
     
     console.log('[FROLIC] Token validation check:', {
@@ -841,10 +851,12 @@ function isTokenExpired(token: string): boolean {
       nowDate: new Date(now * 1000).toISOString(),
       timeUntilExpiry: timeUntilExpiry,
       timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 60),
+      needsProactiveRefresh: needsRefresh && !isExpired,
       isExpired: isExpired
     });
     
-    return isExpired;
+    // Return true if expired OR needs proactive refresh
+    return isExpired || needsRefresh;
   } catch (err) {
     console.log('[FROLIC] Error checking token expiration:', err);
     return true; // Assume expired if we can't parse
@@ -869,6 +881,70 @@ function getTokenExpirationTime(token: string): string {
     return `${expDate.toISOString()} (${diffMinutes > 0 ? `${diffMinutes}m remaining` : `expired ${Math.abs(diffMinutes)}m ago`})`;
   } catch (err) {
     return 'Could not parse token';
+  }
+}
+
+/**
+ * 🔄 ENHANCED: Background token refresh to prevent expiration
+ */
+async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const accessToken = await context.secrets.get('frolic.accessToken');
+    const refreshToken = await context.secrets.get('frolic.refreshToken');
+    
+    if (!accessToken || !refreshToken) {
+      console.log('[FROLIC] Background refresh: No tokens available, skipping');
+      return;
+    }
+    
+    // Check if token needs refresh (proactive check)
+    if (isTokenExpired(accessToken)) {
+      console.log('[FROLIC] Background refresh: Token needs refresh, performing...');
+      const newToken = await performTokenRefresh(context, refreshToken);
+      if (newToken) {
+        console.log('[FROLIC] Background refresh: Successfully refreshed token');
+      } else {
+        console.log('[FROLIC] Background refresh: Failed to refresh token');
+      }
+    } else {
+      console.log('[FROLIC] Background refresh: Token still valid, no refresh needed');
+    }
+  } catch (err) {
+    console.log('[FROLIC] Background refresh error:', err);
+  }
+}
+
+/**
+ * Start background token refresh timer
+ */
+function startBackgroundTokenRefresh(context: vscode.ExtensionContext): void {
+  if (backgroundTokenRefreshTimer) {
+    clearInterval(backgroundTokenRefreshTimer);
+  }
+  
+  console.log('[FROLIC] Starting background token refresh (every 30 minutes)');
+  backgroundTokenRefreshTimer = setInterval(() => {
+    performBackgroundTokenRefresh(context).catch(err => {
+      console.log('[FROLIC] Background token refresh failed:', err);
+    });
+  }, TOKEN_REFRESH_CHECK_INTERVAL);
+  
+  // Also perform initial check after 5 minutes
+  setTimeout(() => {
+    performBackgroundTokenRefresh(context).catch(err => {
+      console.log('[FROLIC] Initial background token refresh failed:', err);
+    });
+  }, 5 * 60 * 1000);
+}
+
+/**
+ * Stop background token refresh timer
+ */
+function stopBackgroundTokenRefresh(): void {
+  if (backgroundTokenRefreshTimer) {
+    clearInterval(backgroundTokenRefreshTimer);
+    backgroundTokenRefreshTimer = null;
+    console.log('[FROLIC] Stopped background token refresh');
   }
 }
 
@@ -939,6 +1015,10 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
     
     console.log('[FROLIC] Access token refreshed and validated successfully');
     updateStatusBar('authenticated');
+    
+    // 🔄 ENHANCED: Start background token refresh after successful refresh
+    startBackgroundTokenRefresh(context);
+    
     return newAccessToken;
     
   } catch (err: any) {
@@ -1574,6 +1654,9 @@ export async function signInCommand(context: vscode.ExtensionContext) {
     
     updateStatusBar('authenticated');
     
+    // 🔄 ENHANCED: Start background token refresh after successful sign-in
+    startBackgroundTokenRefresh(context);
+    
     // Show success message with next steps
     const action = await vscode.window.showInformationMessage(
       '🎉 Successfully signed in to Frolic! Your coding activity will now be tracked for personalized recaps.',
@@ -1970,6 +2053,12 @@ export async function activate(context: vscode.ExtensionContext) {
     // Enhanced activation with multiple sign-in triggers
     initializeAuthenticationFlow(context);
 
+    // 🔄 ENHANCED: Start background token refresh if authenticated
+    const hasTokens = await context.secrets.get('frolic.accessToken') && await context.secrets.get('frolic.refreshToken');
+    if (hasTokens) {
+        startBackgroundTokenRefresh(context);
+    }
+
     console.log(`✅ Frolic Logger is now active! (${LOG_BUFFER.length} events in buffer)`);
 }
 
@@ -1984,6 +2073,9 @@ export function deactivate() {
     
     // Stop the daily digest timer
     stopPeriodicDigestSending();
+    
+    // 🔄 ENHANCED: Stop background token refresh
+    stopBackgroundTokenRefresh();
     
     // 🔄 PHASE 1.3: Create final smart backup before shutdown
     if (LOG_BUFFER.length > 0) {
