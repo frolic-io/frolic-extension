@@ -2199,7 +2199,6 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
     if (LOG_BUFFER.length > 0) {
         const eventCount = LOG_BUFFER.length; // Capture count before clearing
         console.log(`[FROLIC] Sending digest with ${eventCount} events`);
-        console.log(`[FROLIC] Sample events:`, LOG_BUFFER.slice(0, 3)); // Show first 3 events for debugging
         updateStatusBar('sending');
         
         // 🔄 PHASE 1.3: Smart backup before digest sending
@@ -2225,9 +2224,8 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 const timeSinceLastNotification = Date.now() - lastNotificationTime;
                 const notificationThrottleMs = getNotificationThrottleMs();
                 const shouldShowNotification = showNotification && (
-                    lastNotificationTime === 0 || // First notification ever
                     timeSinceLastNotification >= notificationThrottleMs || // Configurable hours since last
-                    digestsSentSinceLastNotification >= 10 // Or 10+ digests sent (fallback)
+                    digestsSentSinceLastNotification >= 25 // Or 25+ digests sent (fallback)
                 );
                 
                 if (shouldShowNotification) {
@@ -2734,8 +2732,7 @@ export async function sendDigestToBackend(
     throw new Error('NO_AUTH_TOKEN');
   }
 
-  console.log(`[FROLIC] Using access token: ${accessToken?.substring(0, 20)}...`);
-  console.log(`[FROLIC] Token expires at: ${getTokenExpirationTime(accessToken)}`);
+  // Token validation successful (removed verbose logging)
 
   try {
     const res = await fetchWithTimeout(apiUrl, {
@@ -2802,9 +2799,6 @@ export async function sendDigestToBackend(
         const newToken = await getValidAccessToken(context);
         if (newToken && newToken !== accessToken) { // Ensure we got a different token
           console.log('[FROLIC] Token refreshed, retrying digest upload...');
-          console.log(`[FROLIC] Old token: ${accessToken.substring(0, 30)}...`);
-          console.log(`[FROLIC] New token: ${newToken.substring(0, 30)}...`);
-          console.log(`[FROLIC] New token expires: ${getTokenExpirationTime(newToken)}`);
           
           // Retry the request with new token
           const retryRes = await fetchWithTimeout(apiUrl, {
