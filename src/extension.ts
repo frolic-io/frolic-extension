@@ -17,6 +17,30 @@ let statusBarItem: vscode.StatusBarItem;
 let activityProvider: FrolicActivityProvider | undefined;
 let extensionContext: vscode.ExtensionContext | undefined;
 
+// 🔄 PHASE 1.3: Smart Backup Triggers - Global state
+let periodicBackupTimer: NodeJS.Timeout | null = null;
+let inactivityBackupTimer: NodeJS.Timeout | null = null;
+let lastBackupTime = 0;
+let lastActivityTime = 0;
+const BACKUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const ACTIVITY_BACKUP_THRESHOLD = 25; // Backup after 25 events
+const MIN_BACKUP_INTERVAL_MS = 30 * 1000; // Minimum 30 seconds between backups
+
+// 🔄 PHASE 1.4: Enhanced Break-Pattern Backup - Additional state
+const MICRO_SESSION_THRESHOLD = 10; // Backup after 10 events (for short bursts)
+const INACTIVITY_BACKUP_DELAY = 3 * 60 * 1000; // 3 minutes of inactivity
+const QUICK_FIX_THRESHOLD = 5; // Backup after 5 events if 2+ minutes since last activity
+
+// 🔄 PHASE 2.1: Smart Notification Throttling - Global state
+let lastNotificationTime = 0;
+let digestsSentSinceLastNotification = 0;
+
+function getNotificationThrottleMs(): number {
+    const config = vscode.workspace.getConfiguration('frolic');
+    const hours = config.get<number>('notificationFrequencyHours', 2);
+    return hours * 60 * 60 * 1000; // Convert hours to milliseconds
+}
+
 // Get configurable limits
 function getBufferLimits() {
     const config = vscode.workspace.getConfiguration('frolic');
@@ -67,6 +91,9 @@ function logEvent(eventType: string, data: any) {
     // Add the entry to the buffer FIRST
     LOG_BUFFER.push(entry);
 
+    // 🔄 PHASE 1.3: Update activity tracking for smart backups
+    lastActivityTime = Date.now();
+
     // Update estimated memory usage
     const entrySize = JSON.stringify(entry).length * 2; // Rough estimate: 2 bytes per character
     bufferMemoryUsage += entrySize;
@@ -94,12 +121,40 @@ function logEvent(eventType: string, data: any) {
         activityProvider.refresh();
     }
 
+    // 🔄 PHASE 1.3: Smart backup trigger - activity-based backup
+    if (LOG_BUFFER.length > 0 && LOG_BUFFER.length % ACTIVITY_BACKUP_THRESHOLD === 0) {
+        // Don't block logging - create backup in background
+        createSmartBackup(`activity-${LOG_BUFFER.length}-events`).catch(err => {
+            console.log('[FROLIC] Activity-based backup failed, will retry later');
+        });
+    }
+
+    // 🔄 PHASE 1.4: Enhanced break-pattern backup triggers
+    const timeSinceLastActivity = Date.now() - (lastActivityTime - 60000); // Previous activity time
+    
+    // Micro-session backup: 10 events for short bursts
+    if (LOG_BUFFER.length > 0 && LOG_BUFFER.length % MICRO_SESSION_THRESHOLD === 0) {
+        createSmartBackup(`micro-session-${LOG_BUFFER.length}-events`).catch(err => {
+            console.log('[FROLIC] Micro-session backup failed, will retry later');
+        });
+    }
+    
+    // Quick-fix backup: 5 events if it's been 2+ minutes since last activity
+    if (LOG_BUFFER.length > 0 && LOG_BUFFER.length % QUICK_FIX_THRESHOLD === 0 && timeSinceLastActivity > 2 * 60 * 1000) {
+        createSmartBackup(`quick-fix-${LOG_BUFFER.length}-events`).catch(err => {
+            console.log('[FROLIC] Quick-fix backup failed, will retry later');
+        });
+    }
+    
+    // Reset inactivity timer on each activity
+    resetInactivityBackupTimer();
+
     // Send digest if buffer gets large (activity-based trigger)
     if (LOG_BUFFER.length >= 50 && LOG_BUFFER.length % 25 === 0) {
         console.log(`[FROLIC] Buffer reached ${LOG_BUFFER.length} events, considering digest send`);
         // Don't block logging - send in background
         if (extensionContext) {
-            sendDigestImmediately(extensionContext).catch(err => {
+            sendDigestImmediately(extensionContext, 3, false).catch(err => {
                 console.log('[FROLIC] Activity-based digest send failed, will retry later');
             });
         }
@@ -130,25 +185,522 @@ function writeLogsToFile() {
     }
 }
 
+/**
+ * Recover session data from backup files on extension startup
+ * This fixes the Friday→Monday data loss issue
+ */
+async function recoverSessionData(context: vscode.ExtensionContext): Promise<number> {
+    let recoveredEvents = 0;
+    
+    try {
+        // Try to recover from workspace backup file first
+        const workspaceEvents = await recoverFromWorkspaceBackup();
+        if (workspaceEvents > 0) {
+            console.log(`[FROLIC] Recovered ${workspaceEvents} events from workspace backup`);
+            recoveredEvents += workspaceEvents;
+        }
+        
+        // Try to recover from VS Code extension storage as fallback
+        if (recoveredEvents === 0) {
+            const storageEvents = await recoverFromExtensionStorage(context);
+            if (storageEvents > 0) {
+                console.log(`[FROLIC] Recovered ${storageEvents} events from extension storage`);
+                recoveredEvents += storageEvents;
+            }
+        }
+        
+        // 🔄 PHASE 1.3: Try to recover from temp directory as final fallback
+        if (recoveredEvents === 0) {
+            const tempEvents = await recoverFromTempDirectory();
+            if (tempEvents > 0) {
+                console.log(`[FROLIC] Recovered ${tempEvents} events from temp directory`);
+                recoveredEvents += tempEvents;
+            }
+        }
+        
+        if (recoveredEvents > 0) {
+            console.log(`[FROLIC] 🔄 Session recovery complete: ${recoveredEvents} total events restored`);
+            
+            // Clean up old backup files after successful recovery
+            await cleanupOldBackups();
+            
+            // Recalculate memory usage after recovery
+            recalculateBufferMemoryUsage();
+        } else {
+            console.log('[FROLIC] No previous session data found to recover');
+        }
+        
+    } catch (error) {
+        console.error('[FROLIC] Session recovery failed:', error);
+        // Don't fail extension activation on recovery errors
+    }
+    
+    return recoveredEvents;
+}
+
+/**
+ * Recover data from workspace backup files (.frolic-log.json and emergency backups)
+ */
+async function recoverFromWorkspaceBackup(): Promise<number> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return 0;
+    }
+    
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    let totalRecovered = 0;
+    
+    try {
+        // 1. Try new smart backup file first (.frolic-session.json)
+        const smartBackupPath = path.join(workspacePath, '.frolic-session.json');
+        if (fs.existsSync(smartBackupPath)) {
+            const recovered = await recoverFromBackupFile(smartBackupPath, 'smart-primary');
+            totalRecovered += recovered;
+        }
+        
+        // 2. Try legacy backup file (.frolic-log.json) for backwards compatibility
+        const legacyBackupPath = path.join(workspacePath, '.frolic-log.json');
+        if (fs.existsSync(legacyBackupPath) && totalRecovered === 0) {
+            const recovered = await recoverFromBackupFile(legacyBackupPath, 'legacy-primary');
+            totalRecovered += recovered;
+        }
+        
+        // 3. Try emergency backup files (timestamped) if no primary recovery
+        if (totalRecovered === 0) {
+            const files = fs.readdirSync(workspacePath);
+            const emergencyBackups = files
+                .filter(file => file.startsWith('.frolic-backup-') && file.endsWith('.json'))
+                .map(file => ({
+                    file,
+                    path: path.join(workspacePath, file),
+                    timestamp: fs.statSync(path.join(workspacePath, file)).mtime
+                }))
+                .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()); // Newest first
+            
+            for (const backup of emergencyBackups) {
+                const recovered = await recoverFromBackupFile(backup.path, 'emergency');
+                totalRecovered += recovered;
+                
+                // Only recover from the most recent emergency backup
+                if (recovered > 0) break;
+            }
+        }
+        
+    } catch (error) {
+        console.error(`[FROLIC] Failed to recover from workspace backups: ${error}`);
+    }
+    
+    return totalRecovered;
+}
+
+/**
+ * Recover data from a specific backup file
+ */
+async function recoverFromBackupFile(filePath: string, backupType: string): Promise<number> {
+    try {
+        const backupData = fs.readFileSync(filePath, 'utf8');
+        const backupJson = JSON.parse(backupData);
+        
+        // Handle both old format (array) and new format (object with events)
+        const backupEvents = Array.isArray(backupJson) ? backupJson : backupJson.events;
+        
+        if (Array.isArray(backupEvents) && backupEvents.length > 0) {
+            // Filter out events older than 7 days to prevent stale data
+            const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+            const recentEvents = backupEvents.filter(event => {
+                const eventTime = new Date(event.timestamp).getTime();
+                return eventTime > sevenDaysAgo;
+            });
+            
+            if (recentEvents.length > 0) {
+                // Merge with existing buffer (in case there's already some data)
+                LOG_BUFFER.push(...recentEvents);
+                
+                // Delete the backup file after successful recovery
+                fs.unlinkSync(filePath);
+                console.log(`[FROLIC] Deleted processed ${backupType} backup: ${path.basename(filePath)}`);
+                
+                return recentEvents.length;
+            }
+        }
+    } catch (error) {
+        console.error(`[FROLIC] Failed to recover from ${backupType} backup ${filePath}: ${error}`);
+    }
+    
+    return 0;
+}
+
+/**
+ * Recover data from VS Code extension storage (fallback)
+ */
+async function recoverFromExtensionStorage(context: vscode.ExtensionContext): Promise<number> {
+    try {
+        // Try new smart backup first
+        let backupData = context.globalState.get<any>('frolic.smartBackup');
+        let backupType = 'smart';
+        let backupKey = 'frolic.smartBackup';
+        
+        // Fall back to legacy backup if no smart backup found
+        if (!backupData) {
+            backupData = context.globalState.get<any[]>('frolic.sessionBackup');
+            backupType = 'legacy';
+            backupKey = 'frolic.sessionBackup';
+        }
+        
+        if (!backupData) {
+            return 0;
+        }
+        
+        let eventsToRecover: any[] = [];
+        
+        // Handle different backup formats
+        if (backupType === 'smart' && backupData.events) {
+            eventsToRecover = backupData.events;
+        } else if (backupType === 'legacy' && Array.isArray(backupData)) {
+            eventsToRecover = backupData;
+        }
+        
+        if (eventsToRecover.length > 0) {
+            // Filter out events older than 7 days
+            const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+            const recentEvents = eventsToRecover.filter(event => {
+                const eventTime = new Date(event.timestamp).getTime();
+                return eventTime > sevenDaysAgo;
+            });
+            
+            if (recentEvents.length > 0) {
+                // Merge with existing buffer
+                LOG_BUFFER.push(...recentEvents);
+                
+                // Clear the storage backup after successful recovery
+                await context.globalState.update(backupKey, undefined);
+                console.log(`[FROLIC] Extension storage recovery (${backupType}): ${recentEvents.length} events restored`);
+                
+                return recentEvents.length;
+            }
+        }
+    } catch (error) {
+        console.error(`[FROLIC] Failed to recover from extension storage: ${error}`);
+    }
+    
+    return 0;
+}
+
+/**
+ * 🔄 PHASE 1.3: Recover data from temp directory as final fallback
+ */
+async function recoverFromTempDirectory(): Promise<number> {
+    try {
+        const os = require('os');
+        const tempDir = os.tmpdir();
+        
+        if (!fs.existsSync(tempDir)) {
+            return 0;
+        }
+        
+        const files = fs.readdirSync(tempDir);
+        const tempBackups = files
+            .filter(file => file.startsWith('frolic-emergency-') && file.endsWith('.json'))
+            .map(file => ({
+                file,
+                path: path.join(tempDir, file),
+                timestamp: fs.statSync(path.join(tempDir, file)).mtime
+            }))
+            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()); // Newest first
+        
+        for (const backup of tempBackups) {
+            const recovered = await recoverFromBackupFile(backup.path, 'temp-emergency');
+            if (recovered > 0) {
+                // Clean up the temp backup after successful recovery
+                try {
+                    fs.unlinkSync(backup.path);
+                    console.log(`[FROLIC] Cleaned up temp backup: ${backup.file}`);
+                } catch (err) {
+                    console.warn(`[FROLIC] Failed to clean up temp backup: ${backup.file}`);
+                }
+                return recovered;
+            }
+        }
+        
+    } catch (error) {
+        console.error('[FROLIC] Temp directory recovery failed:', error);
+    }
+    
+    return 0;
+}
+
+/**
+ * Clean up old backup files (older than 7 days)
+ */
+async function cleanupOldBackups(): Promise<void> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return;
+    }
+    
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    
+    try {
+        // Look for any .frolic-*.json files in workspace
+        const files = fs.readdirSync(workspacePath);
+        const frolicsFiles = files.filter(file => file.startsWith('.frolic-') && file.endsWith('.json'));
+        
+        for (const file of frolicsFiles) {
+            const filePath = path.join(workspacePath, file);
+            const stats = fs.statSync(filePath);
+            
+            if (stats.mtime.getTime() < sevenDaysAgo) {
+                fs.unlinkSync(filePath);
+                console.log(`[FROLIC] Cleaned up old backup file: ${file}`);
+            }
+        }
+    } catch (error) {
+        console.warn(`[FROLIC] Backup cleanup failed: ${error}`);
+    }
+}
+
+/**
+ * Recalculate buffer memory usage after recovery
+ */
+function recalculateBufferMemoryUsage(): void {
+    bufferMemoryUsage = 0;
+    for (const entry of LOG_BUFFER) {
+        const entrySize = JSON.stringify(entry).length * 2;
+        bufferMemoryUsage += entrySize;
+    }
+    console.log(`[FROLIC] Recalculated buffer memory usage: ${(bufferMemoryUsage / 1024 / 1024).toFixed(2)}MB`);
+}
+
+/**
+ * 🔄 PHASE 1.3: Smart backup system with multiple triggers
+ * Creates backups at strategic points to prevent data loss
+ */
+async function createSmartBackup(trigger: string, force = false): Promise<void> {
+    const now = Date.now();
+    
+    // Prevent too frequent backups (unless forced)
+    if (!force && (now - lastBackupTime) < MIN_BACKUP_INTERVAL_MS) {
+        return;
+    }
+    
+    // Only backup if there's meaningful data
+    if (LOG_BUFFER.length === 0) {
+        return;
+    }
+    
+    try {
+        console.log(`[FROLIC] 💾 Smart backup triggered by: ${trigger} (${LOG_BUFFER.length} events)`);
+        
+        // Create multiple backup layers for safety
+        await Promise.all([
+            createWorkspaceBackup(),
+            createExtensionStorageBackup(),
+            createTempDirectoryBackup()
+        ]);
+        
+        lastBackupTime = now;
+        console.log(`[FROLIC] ✅ Smart backup completed (${trigger})`);
+        
+    } catch (error) {
+        console.error(`[FROLIC] ❌ Smart backup failed (${trigger}):`, error);
+    }
+}
+
+/**
+ * Create workspace backup file
+ */
+async function createWorkspaceBackup(): Promise<void> {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (!workspaceFolders || workspaceFolders.length === 0) {
+        return;
+    }
+    
+    const workspacePath = workspaceFolders[0].uri.fsPath;
+    const backupPath = path.join(workspacePath, '.frolic-session.json');
+    
+    const backupData = {
+        timestamp: new Date().toISOString(),
+        sessionId: sessionId,
+        eventCount: LOG_BUFFER.length,
+        events: LOG_BUFFER,
+        metadata: {
+            version: '1.3.0',
+            trigger: 'smart-backup',
+            memoryUsage: bufferMemoryUsage
+        }
+    };
+    
+    fs.writeFileSync(backupPath, JSON.stringify(backupData, null, 2), 'utf8');
+}
+
+/**
+ * Create VS Code extension storage backup
+ */
+async function createExtensionStorageBackup(): Promise<void> {
+    if (!extensionContext) return;
+    
+    const backupData = {
+        timestamp: new Date().toISOString(),
+        sessionId: sessionId,
+        eventCount: LOG_BUFFER.length,
+        events: LOG_BUFFER.slice(-1000), // Limit to last 1000 events for storage efficiency
+        metadata: {
+            version: '1.3.0',
+            trigger: 'smart-backup-storage',
+            truncated: LOG_BUFFER.length > 1000
+        }
+    };
+    
+    await extensionContext.globalState.update('frolic.smartBackup', backupData);
+}
+
+/**
+ * Create OS temp directory backup as final fallback
+ */
+async function createTempDirectoryBackup(): Promise<void> {
+    try {
+        const os = require('os');
+        const tempDir = os.tmpdir();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const tempBackupPath = path.join(tempDir, `frolic-emergency-${timestamp}.json`);
+        
+        const backupData = {
+            timestamp: new Date().toISOString(),
+            sessionId: sessionId,
+            eventCount: LOG_BUFFER.length,
+            events: LOG_BUFFER,
+            metadata: {
+                version: '1.3.0',
+                trigger: 'smart-backup-temp',
+                workspace: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'unknown'
+            }
+        };
+        
+        fs.writeFileSync(tempBackupPath, JSON.stringify(backupData, null, 2), 'utf8');
+        
+        // Clean up old temp backups (keep only last 3)
+        await cleanupTempBackups(tempDir);
+        
+    } catch (error) {
+        console.warn('[FROLIC] Temp directory backup failed:', error);
+    }
+}
+
+/**
+ * Clean up old temp backup files
+ */
+async function cleanupTempBackups(tempDir: string): Promise<void> {
+    try {
+        const files = fs.readdirSync(tempDir);
+        const frolicsBackups = files
+            .filter(file => file.startsWith('frolic-emergency-') && file.endsWith('.json'))
+            .map(file => ({
+                file,
+                path: path.join(tempDir, file),
+                timestamp: fs.statSync(path.join(tempDir, file)).mtime
+            }))
+            .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        
+        // Keep only the 3 most recent backups
+        const filesToDelete = frolicsBackups.slice(3);
+        for (const backup of filesToDelete) {
+            fs.unlinkSync(backup.path);
+        }
+        
+    } catch (error) {
+        console.warn('[FROLIC] Temp backup cleanup failed:', error);
+    }
+}
+
+/**
+ * Start periodic backup timer (every 5 minutes during active coding)
+ */
+function startPeriodicBackup(): void {
+    if (periodicBackupTimer) {
+        clearInterval(periodicBackupTimer);
+    }
+    
+    periodicBackupTimer = setInterval(async () => {
+        const now = Date.now();
+        const timeSinceLastActivity = now - lastActivityTime;
+        
+        // Only backup if there was recent activity (within last 10 minutes)
+        if (timeSinceLastActivity < 10 * 60 * 1000) {
+            await createSmartBackup('periodic-5min');
+        }
+    }, BACKUP_INTERVAL_MS);
+    
+    console.log('[FROLIC] ⏰ Periodic backup timer started (every 5 minutes)');
+}
+
+/**
+ * Stop periodic backup timer
+ */
+function stopPeriodicBackup(): void {
+    if (periodicBackupTimer) {
+        clearInterval(periodicBackupTimer);
+        periodicBackupTimer = null;
+        console.log('[FROLIC] ⏰ Periodic backup timer stopped');
+    }
+}
+
+/**
+ * 🔄 PHASE 1.4: Reset inactivity backup timer
+ * Called on each coding activity to restart the inactivity countdown
+ */
+function resetInactivityBackupTimer(): void {
+    // Clear existing timer
+    if (inactivityBackupTimer) {
+        clearTimeout(inactivityBackupTimer);
+        inactivityBackupTimer = null;
+    }
+    
+    // Start new inactivity timer
+    inactivityBackupTimer = setTimeout(async () => {
+        // Only backup if there's meaningful data and user hasn't been active
+        if (LOG_BUFFER.length > 0) {
+            const timeSinceLastActivity = Date.now() - lastActivityTime;
+            if (timeSinceLastActivity >= INACTIVITY_BACKUP_DELAY) {
+                await createSmartBackup('inactivity-3min');
+                console.log('[FROLIC] 💤 Inactivity backup created (3 minutes of no coding)');
+            }
+        }
+        inactivityBackupTimer = null;
+    }, INACTIVITY_BACKUP_DELAY);
+}
+
+/**
+ * 🔄 PHASE 1.4: Stop inactivity backup timer
+ */
+function stopInactivityBackupTimer(): void {
+    if (inactivityBackupTimer) {
+        clearTimeout(inactivityBackupTimer);
+        inactivityBackupTimer = null;
+        console.log('[FROLIC] 💤 Inactivity backup timer stopped');
+    }
+}
+
 function getApiBaseUrl(): string {
   const config = vscode.workspace.getConfiguration('frolic');
-  const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.io';
+      const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.io';
   
-  // Debug: Log what URL we're using
-  console.log(`[FROLIC] getApiBaseUrl() returning: ${url}`);
+  // Log the URL for debugging
+  console.log('[FROLIC] getApiBaseUrl() returning:', url);
   
-  // Validate URL format
-  try {
-    new URL(url);
     return url;
-  } catch {
-    console.warn('[FROLIC] Invalid API URL in settings, using default');
-    return 'https://getfrolic.io';
-  }
 }
 
 // Helper function to add timeout to fetch requests
 async function fetchWithTimeout(url: string, options: any, timeoutMs: number = 30000): Promise<Response> {
+  // Check if we're in a test environment or if fetch is not available
+  if (typeof fetch === 'undefined') {
+    // For Node.js environment in tests, we'll return a mock response
+    // In actual VS Code environment, fetch is available
+    console.log('[FROLIC] Fetch not available in this environment');
+    throw new Error('Fetch not available');
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
@@ -170,7 +722,7 @@ function base64URLEncode(str: Buffer) {
   return str.toString('base64')
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    .replace(/=/g, '');
 }
 
 function generateCodeVerifier(): string {
@@ -192,12 +744,19 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   const accessToken = await context.secrets.get('frolic.accessToken');
   const refreshToken = await context.secrets.get('frolic.refreshToken');
   
+  console.log('[FROLIC] getValidAccessToken called:', {
+    hasAccessToken: !!accessToken,
+    hasRefreshToken: !!refreshToken,
+    accessTokenLength: accessToken?.length || 0
+  });
+  
   // If no access token, check if we have refresh token
   if (!accessToken) {
     if (refreshToken) {
       console.log('[FROLIC] No access token but refresh token exists, attempting refresh');
       return await performTokenRefresh(context, refreshToken);
     }
+    console.log('[FROLIC] No access token and no refresh token available');
     return null;
   }
   
@@ -213,6 +772,7 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
     }
   }
   
+  console.log('[FROLIC] Access token is valid, returning it');
   return accessToken;
 }
 
@@ -258,13 +818,33 @@ async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<voi
 function isTokenExpired(token: string): boolean {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3) return true;
+    if (parts.length !== 3) {
+      console.log('[FROLIC] Token validation failed: Invalid JWT format (not 3 parts)');
+      return true;
+    }
     
     const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
     const now = Math.floor(Date.now() / 1000);
     
-    // Check if token has exp claim and if it's expired
-    return payload.exp && payload.exp < now;
+    if (!payload.exp) {
+      console.log('[FROLIC] Token validation: No expiration claim found, treating as valid');
+      return false; // No expiration claim means token doesn't expire
+    }
+    
+    const timeUntilExpiry = payload.exp - now;
+    const isExpired = payload.exp < now;
+    
+    console.log('[FROLIC] Token validation check:', {
+      exp: payload.exp,
+      expDate: new Date(payload.exp * 1000).toISOString(),
+      now: now,
+      nowDate: new Date(now * 1000).toISOString(),
+      timeUntilExpiry: timeUntilExpiry,
+      timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 60),
+      isExpired: isExpired
+    });
+    
+    return isExpired;
   } catch (err) {
     console.log('[FROLIC] Error checking token expiration:', err);
     return true; // Assume expired if we can't parse
@@ -367,136 +947,145 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
   }
 }
 
-/**
- * Send a session digest to your backend.
- * @param sessionId string (UUID)
- * @param digest object (summary)
- * @param context vscode.ExtensionContext for accessing secrets
- */
-export async function sendDigestToBackend(
-  sessionId: string,
-  digest: any,
-  context: vscode.ExtensionContext
-) {
-  const apiBaseUrl = getApiBaseUrl();
-  const apiUrl = `${apiBaseUrl}/api/digests`;
-  console.log(`[FROLIC] Sending digest to: ${apiUrl}`); // Debug log
-  
-  // Try to get a valid access token (will refresh if needed)
-  const accessToken = await getValidAccessToken(context);
-  
-  if (!accessToken) {
-    console.log('[FROLIC] No valid access token available, skipping digest upload');
-    throw new Error('NO_AUTH_TOKEN');
-  }
-
-  console.log(`[FROLIC] Using access token: ${accessToken?.substring(0, 20)}...`); // Debug log
-  console.log(`[FROLIC] Token expires at: ${getTokenExpirationTime(accessToken)}`); // Debug token expiry
-
-  try {
-    const res = await fetchWithTimeout(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
-      },
-      body: JSON.stringify({ sessionId, digest })
-    }, 30000); // 30 second timeout
-
-    if (!res.ok) {
-      const errorText = await res.text();
-      
-      // Handle specific HTTP status codes
-      if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
-        // Token expired - clear it and try to refresh
-        await context.secrets.delete('frolic.accessToken');
-        console.log('[FROLIC] Token expired, cleared stored token');
-        
-        // Try to refresh token and retry the request once
-        const newToken = await getValidAccessToken(context);
-        if (newToken && newToken !== accessToken) { // Ensure we got a different token
-          console.log('[FROLIC] Token refreshed, retrying digest upload...');
-          console.log(`[FROLIC] Old token: ${accessToken.substring(0, 30)}...`);
-          console.log(`[FROLIC] New token: ${newToken.substring(0, 30)}...`);
-          console.log(`[FROLIC] New token expires: ${getTokenExpirationTime(newToken)}`);
-          // Retry the request with new token
-          const retryRes = await fetchWithTimeout(apiUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${newToken}`,
-              'Content-Type': 'application/json',
-              'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
-            },
-            body: JSON.stringify({ sessionId, digest })
-          }, 30000);
-          
-          if (retryRes.ok) {
-            console.log('[FROLIC] Digest uploaded successfully after token refresh');
-            return await retryRes.json();
-          } else {
-            const retryErrorText = await retryRes.text();
-            console.log(`[FROLIC] Retry after token refresh failed: ${retryRes.status} ${retryErrorText}`);
-            
-            // If the refreshed token also fails, clear everything and force re-authentication
-            if (retryRes.status === 401) {
-              console.log('[FROLIC] Refreshed token also rejected - clearing all auth state');
-              await clearAllAuthTokens(context);
-              updateStatusBar('unauthenticated');
-              
-              // Automatically prompt user to re-authenticate
-              const selection = await vscode.window.showWarningMessage(
-                '🔐 Frolic: Authentication expired. Please sign in again to continue sending digests.',
-                'Sign In Now',
-                'Later'
-              );
-              
-              if (selection === 'Sign In Now') {
-                // Small delay to ensure UI is ready
-                setTimeout(() => {
-                  vscode.commands.executeCommand('frolic.signIn');
-                }, 500);
-              }
-            }
-            throw new Error('AUTH_TOKEN_EXPIRED');
-          }
-        } else {
-          console.log('[FROLIC] Could not refresh token or got same token back');
-          await clearAllAuthTokens(context);
-          updateStatusBar('unauthenticated');
-          throw new Error('AUTH_TOKEN_EXPIRED');
-        }
-      } else if (res.status === 403) {
-        console.error('[FROLIC] Access forbidden - check API permissions');
-        throw new Error('ACCESS_FORBIDDEN');
-      } else if (res.status >= 500) {
-        console.error(`[FROLIC] Server error: ${res.status} ${errorText}`);
-        throw new Error('SERVER_ERROR');
-      } else {
-        console.error(`[FROLIC] Client error: ${res.status} ${errorText}`);
-        throw new Error('CLIENT_ERROR');
-      }
-    }
-
-    // Success - only log, don't show notification for background operations
-    console.log('[FROLIC] Digest uploaded successfully');
-    return await res.json();
-  } catch (err: any) {
-    // Handle different types of errors appropriately
-    if (err.name === 'AbortError' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
-      console.log('[FROLIC] Network unavailable, will retry later');
-      throw new Error('NETWORK_ERROR');
-    } else if (err.message === 'NO_AUTH_TOKEN' || err.message === 'AUTH_TOKEN_EXPIRED') {
-      // Re-throw auth errors as-is
-      throw err;
-    } else {
-      console.error('[FROLIC] Unexpected error sending digest:', err);
-      throw new Error('UNKNOWN_ERROR');
-    }
-  }
-}
-
 // --- Digest analyzer logic (from scripts/analyzeLogs.ts) ---
+
+/**
+ * 🔄 PHASE 2.1: Enhanced AI Collaboration Pattern Detection
+ * Analyzes code changes to identify AI collaboration patterns and learning signals
+ */
+function detectAICollaborationPatterns(changeText: string, change: any): any {
+  const signals = {
+    // AI Usage Patterns
+    isLikelyAI: change.likelyAI || false,
+    aiConfidence: 0,
+    aiPatterns: [] as string[],
+    
+    // Learning Collaboration Patterns
+    learningSignals: [] as string[],
+    complexityLevel: 'unknown' as 'simple' | 'moderate' | 'complex' | 'advanced' | 'unknown',
+    
+    // Code Quality Indicators
+    codeQualitySignals: [] as string[],
+    
+    // Problem-Solving Patterns
+    problemSolvingSignals: [] as string[]
+  };
+
+  // Enhanced AI detection patterns
+  const aiPatterns = {
+    // Large, complete code blocks (typical AI generation)
+    largeInsertion: change.textLength > 100 && change.rangeLength === 0,
+    
+    // Complete function/component patterns
+    completeFunction: /^(function|const|class|export|async function|const \w+ = \(|const \w+ = async)/m.test(changeText),
+    
+    // Multi-line structured code
+    structuredCode: changeText.split('\n').length > 5 && /^[\s]*[{}();][\s]*$/m.test(changeText),
+    
+    // Import statement blocks
+    importBlock: /^import\s+.*?from\s+['"`][^'"`]+['"`];?$/m.test(changeText) && changeText.split('\n').length > 2,
+    
+    // Complete JSX/HTML structures
+    completeJSX: /<[A-Z][a-zA-Z0-9]*[^>]*>[\s\S]*<\/[A-Z][a-zA-Z0-9]*>/.test(changeText),
+    
+    // Configuration/boilerplate patterns
+    configPattern: /(module\.exports|export default|\.config\.|\.json|package\.json)/.test(changeText)
+  };
+
+  // Calculate AI confidence score
+  let aiScore = 0;
+  if (aiPatterns.largeInsertion) aiScore += 30;
+  if (aiPatterns.completeFunction) aiScore += 25;
+  if (aiPatterns.structuredCode) aiScore += 20;
+  if (aiPatterns.importBlock) aiScore += 15;
+  if (aiPatterns.completeJSX) aiScore += 20;
+  if (aiPatterns.configPattern) aiScore += 10;
+  if (change.likelyAI) aiScore += 40; // Existing detection
+
+  signals.aiConfidence = Math.min(aiScore, 100);
+  signals.isLikelyAI = signals.aiConfidence > 50;
+
+  // Identify specific AI patterns
+  if (aiPatterns.largeInsertion) signals.aiPatterns.push('large_code_insertion');
+  if (aiPatterns.completeFunction) signals.aiPatterns.push('complete_function_generation');
+  if (aiPatterns.structuredCode) signals.aiPatterns.push('structured_code_block');
+  if (aiPatterns.importBlock) signals.aiPatterns.push('import_statement_block');
+  if (aiPatterns.completeJSX) signals.aiPatterns.push('complete_component_structure');
+  if (aiPatterns.configPattern) signals.aiPatterns.push('configuration_boilerplate');
+
+  // Learning collaboration signals
+  const learningPatterns = {
+    // Experimental/learning code
+    hasComments: /\/\/|\/\*|\*\/|#/.test(changeText),
+    hasConsoleLog: /console\.(log|warn|error|debug)/.test(changeText),
+    hasTodoComments: /TODO|FIXME|NOTE|HACK/i.test(changeText),
+    
+    // Error handling patterns (learning to handle edge cases)
+    hasErrorHandling: /(try|catch|throw|Error|exception)/i.test(changeText),
+    
+    // Testing patterns (learning to test)
+    hasTestCode: /(test|spec|describe|it|expect|assert)/i.test(changeText),
+    
+    // Documentation patterns (learning to document)
+    hasDocumentation: /\/\*\*|@param|@returns|@example/i.test(changeText)
+  };
+
+  if (learningPatterns.hasComments) signals.learningSignals.push('code_documentation');
+  if (learningPatterns.hasConsoleLog) signals.learningSignals.push('debugging_exploration');
+  if (learningPatterns.hasTodoComments) signals.learningSignals.push('planning_annotations');
+  if (learningPatterns.hasErrorHandling) signals.learningSignals.push('error_handling_practice');
+  if (learningPatterns.hasTestCode) signals.learningSignals.push('testing_implementation');
+  if (learningPatterns.hasDocumentation) signals.learningSignals.push('documentation_writing');
+
+  // Complexity assessment
+  const complexityIndicators = {
+    lineCount: changeText.split('\n').length,
+    functionCount: (changeText.match(/function|=>/g) || []).length,
+    conditionalCount: (changeText.match(/if|else|switch|case|\?|&&|\|\|/g) || []).length,
+    loopCount: (changeText.match(/for|while|forEach|map|filter|reduce/g) || []).length,
+    asyncCount: (changeText.match(/async|await|Promise|then|catch/g) || []).length
+  };
+
+  let complexityScore = 0;
+  complexityScore += Math.min(complexityIndicators.lineCount / 5, 10);
+  complexityScore += complexityIndicators.functionCount * 5;
+  complexityScore += complexityIndicators.conditionalCount * 3;
+  complexityScore += complexityIndicators.loopCount * 4;
+  complexityScore += complexityIndicators.asyncCount * 6;
+
+  if (complexityScore < 5) signals.complexityLevel = 'simple';
+  else if (complexityScore < 15) signals.complexityLevel = 'moderate';
+  else if (complexityScore < 30) signals.complexityLevel = 'complex';
+  else signals.complexityLevel = 'advanced';
+
+  // Code quality signals
+  const qualityPatterns = {
+    hasTypeAnnotations: /(: string|: number|: boolean|: \w+\[\]|interface|type)/.test(changeText),
+    hasProperNaming: !/\b(temp|tmp|foo|bar|test123|asdf)\b/i.test(changeText),
+    hasModularStructure: /(export|import|module)/.test(changeText),
+    hasErrorBoundaries: /(try|catch|finally|throw)/.test(changeText)
+  };
+
+  if (qualityPatterns.hasTypeAnnotations) signals.codeQualitySignals.push('type_safety');
+  if (qualityPatterns.hasProperNaming) signals.codeQualitySignals.push('good_naming_conventions');
+  if (qualityPatterns.hasModularStructure) signals.codeQualitySignals.push('modular_architecture');
+  if (qualityPatterns.hasErrorBoundaries) signals.codeQualitySignals.push('error_handling');
+
+  // Problem-solving patterns
+  const problemSolvingPatterns = {
+    hasRefactoring: change.rangeLength > 0 && change.textLength > change.rangeLength,
+    hasDebugging: /console\.(log|warn|error)|debugger|\.log\(/.test(changeText),
+    hasOptimization: /(useMemo|useCallback|memo|lazy|React\.lazy)/.test(changeText),
+    hasAPIIntegration: /(fetch|axios|api|endpoint|request|response)/.test(changeText)
+  };
+
+  if (problemSolvingPatterns.hasRefactoring) signals.problemSolvingSignals.push('code_refactoring');
+  if (problemSolvingPatterns.hasDebugging) signals.problemSolvingSignals.push('debugging_session');
+  if (problemSolvingPatterns.hasOptimization) signals.problemSolvingSignals.push('performance_optimization');
+  if (problemSolvingPatterns.hasAPIIntegration) signals.problemSolvingSignals.push('api_integration');
+
+  return signals;
+}
 
 function analyzeLogs(logs: any[]): any {
   // === RAW DATA COLLECTION (Minimal Processing) ===
@@ -577,7 +1166,9 @@ function analyzeLogs(logs: any[]): any {
           timestamp: entry.timestamp,
           change: changeText.substring(0, 500), // Limit size but keep raw
           size: change.textLength,
-          type: change.textLength > change.rangeLength ? 'addition' : 'modification'
+          type: change.textLength > change.rangeLength ? 'addition' : 'modification',
+          // 🔄 PHASE 2.1: Enhanced AI collaboration detection
+          aiCollaborationSignals: detectAICollaborationPatterns(changeText, change)
         });
       }
 
@@ -674,7 +1265,12 @@ function analyzeLogs(logs: any[]): any {
         'coding_patterns_analysis',
         'project_complexity_assessment',
         'productivity_insights',
-        'personalized_recommendations'
+        'personalized_recommendations',
+        // 🔄 PHASE 2.1: AI collaboration analysis
+        'ai_collaboration_patterns',
+        'ai_learning_progression',
+        'ai_dependency_assessment',
+        'human_ai_balance_analysis'
       ],
       
       // Provide context, not conclusions
@@ -684,6 +1280,98 @@ function analyzeLogs(logs: any[]): any {
         isMultiFileSession: files.size > 5,
         hasLargeChanges: totalLinesAdded > 200,
         showsAIUsage: aiInsertions > 0
+      },
+
+      // 🔄 PHASE 2.1: Enhanced AI collaboration context
+      aiCollaborationContext: {
+        // AI usage statistics
+        totalAIInsertions: aiInsertions,
+        aiUsagePercentage: logs.length > 0 ? Math.round((aiInsertions / logs.filter(l => l.eventType === 'file_edit').length) * 100) : 0,
+        
+        // AI collaboration patterns from code samples
+        aiPatternsSummary: codeChangesSample.reduce((acc: any, sample: any) => {
+          if (sample.aiCollaborationSignals) {
+            const signals = sample.aiCollaborationSignals;
+            
+            // Aggregate AI patterns
+            signals.aiPatterns?.forEach((pattern: string) => {
+              acc.aiPatterns[pattern] = (acc.aiPatterns[pattern] || 0) + 1;
+            });
+            
+            // Aggregate learning signals
+            signals.learningSignals?.forEach((signal: string) => {
+              acc.learningSignals[signal] = (acc.learningSignals[signal] || 0) + 1;
+            });
+            
+            // Aggregate complexity levels
+            if (signals.complexityLevel && signals.complexityLevel !== 'unknown') {
+              acc.complexityLevels[signals.complexityLevel] = (acc.complexityLevels[signals.complexityLevel] || 0) + 1;
+            }
+            
+            // Aggregate code quality signals
+            signals.codeQualitySignals?.forEach((signal: string) => {
+              acc.codeQualitySignals[signal] = (acc.codeQualitySignals[signal] || 0) + 1;
+            });
+            
+            // Aggregate problem-solving signals
+            signals.problemSolvingSignals?.forEach((signal: string) => {
+              acc.problemSolvingSignals[signal] = (acc.problemSolvingSignals[signal] || 0) + 1;
+            });
+            
+            // Track AI confidence distribution
+            if (signals.aiConfidence > 0) {
+              const confidenceRange = signals.aiConfidence >= 80 ? 'high' : 
+                                    signals.aiConfidence >= 50 ? 'medium' : 'low';
+              acc.aiConfidenceDistribution[confidenceRange] = (acc.aiConfidenceDistribution[confidenceRange] || 0) + 1;
+            }
+          }
+          return acc;
+        }, {
+          aiPatterns: {},
+          learningSignals: {},
+          complexityLevels: {},
+          codeQualitySignals: {},
+          problemSolvingSignals: {},
+          aiConfidenceDistribution: {}
+        }),
+        
+        // Session-level AI collaboration insights
+        aiCollaborationInsights: {
+          hasHighConfidenceAI: codeChangesSample.some((sample: any) => 
+            sample.aiCollaborationSignals?.aiConfidence > 80
+          ),
+          hasLearningSignals: codeChangesSample.some((sample: any) => 
+            sample.aiCollaborationSignals?.learningSignals?.length > 0
+          ),
+          hasComplexAICode: codeChangesSample.some((sample: any) => 
+            sample.aiCollaborationSignals?.complexityLevel === 'complex' || 
+            sample.aiCollaborationSignals?.complexityLevel === 'advanced'
+          ),
+          hasQualitySignals: codeChangesSample.some((sample: any) => 
+            sample.aiCollaborationSignals?.codeQualitySignals?.length > 0
+          ),
+          hasProblemSolving: codeChangesSample.some((sample: any) => 
+            sample.aiCollaborationSignals?.problemSolvingSignals?.length > 0
+          ),
+          
+          // AI learning progression indicators
+          aiLearningProgression: {
+            isExploringNewConcepts: codeChangesSample.some((sample: any) => 
+              sample.aiCollaborationSignals?.learningSignals?.includes('debugging_exploration') ||
+              sample.aiCollaborationSignals?.learningSignals?.includes('planning_annotations')
+            ),
+            isApplyingBestPractices: codeChangesSample.some((sample: any) => 
+              sample.aiCollaborationSignals?.codeQualitySignals?.includes('type_safety') ||
+              sample.aiCollaborationSignals?.codeQualitySignals?.includes('error_handling')
+            ),
+            isRefactoringCode: codeChangesSample.some((sample: any) => 
+              sample.aiCollaborationSignals?.problemSolvingSignals?.includes('code_refactoring')
+            ),
+            isWritingTests: codeChangesSample.some((sample: any) => 
+              sample.aiCollaborationSignals?.learningSignals?.includes('testing_implementation')
+            )
+          }
+        }
       }
     }
   };
@@ -807,13 +1495,49 @@ export async function signInCommand(context: vscode.ExtensionContext) {
       
       progress.report({ message: "Saving authentication..." });
       
-      // Store tokens securely
+      // Store tokens securely with detailed logging
+      console.log('[FROLIC SIGNIN] About to store access token, length:', accessToken?.length);
       await context.secrets.store('frolic.accessToken', accessToken);
+      
+      // Immediately verify access token storage
+      console.log('[FROLIC SIGNIN] Verifying access token storage...');
+      const storedAccessToken = await context.secrets.get('frolic.accessToken');
+      const accessTokenStored = storedAccessToken === accessToken;
+      console.log('[FROLIC SIGNIN] Access token verification:', {
+        stored: !!storedAccessToken,
+        matches: accessTokenStored,
+        originalLength: accessToken?.length || 0,
+        storedLength: storedAccessToken?.length || 0
+      });
+      
       if (refreshToken) {
+        console.log('[FROLIC SIGNIN] About to store refresh token, length:', refreshToken?.length);
         await context.secrets.store('frolic.refreshToken', refreshToken);
-        console.log('[FROLIC] Stored both access and refresh tokens');
+        
+        // Immediately verify refresh token storage
+        console.log('[FROLIC SIGNIN] Verifying refresh token storage...');
+        const storedRefreshToken = await context.secrets.get('frolic.refreshToken');
+        const refreshTokenStored = storedRefreshToken === refreshToken;
+        console.log('[FROLIC SIGNIN] Refresh token verification:', {
+          stored: !!storedRefreshToken,
+          matches: refreshTokenStored,
+          originalLength: refreshToken?.length || 0,
+          storedLength: storedRefreshToken?.length || 0
+        });
+        
+        if (accessTokenStored && refreshTokenStored) {
+          console.log('[FROLIC SIGNIN] ✅ Both tokens stored and verified successfully');
       } else {
-        console.log('[FROLIC] Only access token received (no refresh token)');
+          console.error('[FROLIC SIGNIN] ❌ Token storage verification failed!', {
+            accessTokenOK: accessTokenStored,
+            refreshTokenOK: refreshTokenStored
+          });
+        }
+      } else {
+        console.log('[FROLIC SIGNIN] Only access token received (no refresh token)');
+        if (!accessTokenStored) {
+          console.error('[FROLIC SIGNIN] ❌ Access token storage verification failed!');
+        }
       }
       
       // Clean up PKCE parameters
@@ -823,7 +1547,31 @@ export async function signInCommand(context: vscode.ExtensionContext) {
       return { accessToken, refreshToken };
     });
     
-    // Success!
+    // Success! But let's verify tokens one more time
+    console.log('[FROLIC SIGNIN] Sign-in flow completed, performing final token verification...');
+    const finalAccessToken = await context.secrets.get('frolic.accessToken');
+    const finalRefreshToken = await context.secrets.get('frolic.refreshToken');
+    
+    console.log('[FROLIC SIGNIN] Final verification results:', {
+      accessToken: {
+        exists: !!finalAccessToken,
+        length: finalAccessToken?.length || 0,
+        preview: finalAccessToken ? finalAccessToken.substring(0, 20) + '...' : 'null'
+      },
+      refreshToken: {
+        exists: !!finalRefreshToken,
+        length: finalRefreshToken?.length || 0,
+        preview: finalRefreshToken ? finalRefreshToken.substring(0, 20) + '...' : 'null'
+      }
+    });
+    
+    if (!finalAccessToken) {
+      console.error('[FROLIC SIGNIN] 🚨 CRITICAL: Access token is missing after sign-in!');
+      vscode.window.showErrorMessage('🚨 Critical: Tokens were not saved! Please check Extension Host logs.');
+      updateStatusBar('unauthenticated');
+      return;
+    }
+    
     updateStatusBar('authenticated');
     
     // Show success message with next steps
@@ -948,8 +1696,11 @@ async function initializeAuthenticationFlow(context: vscode.ExtensionContext) {
     }
 }
 
-export function activate(context: vscode.ExtensionContext) {
-    console.log('✅ Frolic Logger is now active!');
+
+
+export async function activate(context: vscode.ExtensionContext) {
+    console.log('🚀 Frolic Logger is activating...');
+    extensionContext = context;
 
     // Store context globally for activity-based digest sending
     extensionContext = context;
@@ -959,6 +1710,13 @@ export function activate(context: vscode.ExtensionContext) {
     statusBarItem.command = 'frolic.flushLogs';
     context.subscriptions.push(statusBarItem);
     updateStatusBar('initializing');
+
+    // 🔄 PHASE 1.1: Session Data Recovery System
+    console.log('[FROLIC] 🔄 Starting session data recovery...');
+    const recoveredEvents = await recoverSessionData(context);
+    if (recoveredEvents > 0) {
+        console.log(`[FROLIC] ✅ Successfully recovered ${recoveredEvents} events from previous session`);
+    }
 
     // Create and register tree view
     activityProvider = new FrolicActivityProvider(context);
@@ -1053,7 +1811,7 @@ export function activate(context: vscode.ExtensionContext) {
             
             if (choice === 'Send Now') {
                 try {
-                    await sendDigestImmediately(context);
+                    await sendDigestImmediately(context, 3, false); // Don't show notification (we show our own)
                     vscode.window.showInformationMessage('✅ Frolic: Logs saved and digest sent successfully');
                 } catch (err) {
                     vscode.window.showWarningMessage('⚠️ Frolic: Logs saved to file, but network upload failed', 'View Logs');
@@ -1103,7 +1861,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-            const eventCount = await sendDigestImmediately(context);
+            const eventCount = await sendDigestImmediately(context, 3, false); // Don't show notification (we show our own)
             if (eventCount > 0) {
                 vscode.window.showInformationMessage(`✅ Frolic: Digest sent successfully! (${eventCount} events processed)`);
             } else {
@@ -1129,14 +1887,14 @@ export function activate(context: vscode.ExtensionContext) {
                         }
                     });
             } else if (err.message === 'AUTH_TOKEN_EXPIRED') {
-                vscode.window.showWarningMessage('🔐 Frolic: Authentication expired. Your events are preserved and will be sent after re-authentication.', 'Sign In Now')
+                vscode.window.showWarningMessage('🔐 Frolic: Authentication expired. Please sign in again to continue sending digests.', 'Sign In')
                     .then(selection => {
-                        if (selection === 'Sign In Now') {
+                        if (selection === 'Sign In') {
                             vscode.commands.executeCommand('frolic.signIn');
                         }
                     });
             } else {
-                vscode.window.showErrorMessage(`❌ Frolic: Failed to send digest - ${err.message}`, 'Retry');
+                vscode.window.showErrorMessage(`❌ Frolic: Network error occurred: ${err.message}`, 'Retry');
             }
         }
     });
@@ -1185,45 +1943,124 @@ export function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(signOutCmd);
 
-    // Start daily digest sending
+    // Register debug command for troubleshooting (can be triggered from status bar)
+
+
+    // 🔄 PHASE 1.3: Start smart backup system
+    startPeriodicBackup();
+    
+    // 🔄 PHASE 1.4: Start inactivity backup monitoring
+    resetInactivityBackupTimer();
+
+    // 🔄 PHASE 1.3: Window focus loss backup trigger
+    context.subscriptions.push(
+        vscode.window.onDidChangeWindowState(state => {
+            if (!state.focused) {
+                // Window lost focus - create backup
+                createSmartBackup('window-focus-loss').catch(err => {
+                    console.log('[FROLIC] Focus loss backup failed');
+                });
+            }
+        })
+    );
+
+    // Start daily digest sending (with recovered data if any)
     startPeriodicDigestSending(context);
 
     // Enhanced activation with multiple sign-in triggers
     initializeAuthenticationFlow(context);
+
+    console.log(`✅ Frolic Logger is now active! (${LOG_BUFFER.length} events in buffer)`);
 }
 
 export function deactivate() {
     console.log('🛑 Frolic Logger is deactivating...');
     
-    // Stop the daily digest timer first
+    // 🔄 PHASE 1.3: Stop smart backup system
+    stopPeriodicBackup();
+    
+    // 🔄 PHASE 1.4: Stop inactivity backup monitoring
+    stopInactivityBackupTimer();
+    
+    // Stop the daily digest timer
     stopPeriodicDigestSending();
     
-    // Write logs to file as backup - this is synchronous and reliable
-    writeLogsToFile();
-    
-    // For the final digest, we'll trigger an immediate send if there's unsent data
-    // but we can't wait for it to complete due to VS Code's synchronous deactivate design
+    // 🔄 PHASE 1.3: Create final smart backup before shutdown
     if (LOG_BUFFER.length > 0) {
         console.log(`[FROLIC] Extension deactivating with ${LOG_BUFFER.length} unsent events.`);
-        console.log('[FROLIC] Logs have been written to .frolic-log.json as backup.');
+        console.log('[FROLIC] 💾 Creating final smart backup layers...');
         
-        // Attempt to send final digest in background (fire-and-forget)
-        // This is the best we can do with VS Code's synchronous deactivate
         try {
-            const logs = [...LOG_BUFFER]; // Create copy
-            const digest = analyzeLogs(logs);
-            console.log('[FROLIC] Final digest prepared but cannot be sent synchronously.');
-            console.log('[FROLIC] Consider enabling more frequent digest sending to avoid data loss.');
+            const workspaceFolders = vscode.workspace.workspaceFolders;
+            if (workspaceFolders && workspaceFolders.length > 0) {
+                const workspacePath = workspaceFolders[0].uri.fsPath;
+                
+                // 1. Primary backup (new smart backup format)
+                const primaryBackupPath = path.join(workspacePath, '.frolic-session.json');
+                const backupData = {
+                    timestamp: new Date().toISOString(),
+                    sessionId: sessionId,
+                    eventCount: LOG_BUFFER.length,
+                    events: LOG_BUFFER,
+                    metadata: {
+                        version: '1.3.0',
+                        trigger: 'deactivation',
+                        memoryUsage: bufferMemoryUsage
+                    }
+                };
+                fs.writeFileSync(primaryBackupPath, JSON.stringify(backupData, null, 2), 'utf8');
+                console.log('[FROLIC] ✅ Primary backup: .frolic-session.json created');
+                
+                // 2. Emergency backup with timestamp
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const emergencyBackupPath = path.join(workspacePath, `.frolic-backup-${timestamp}.json`);
+                fs.writeFileSync(emergencyBackupPath, JSON.stringify(backupData, null, 2), 'utf8');
+                console.log(`[FROLIC] ✅ Emergency backup: ${emergencyBackupPath} created`);
+                
+                // 3. Temp directory backup as final fallback
+                try {
+                    const os = require('os');
+                    const tempDir = os.tmpdir();
+                    const tempBackupPath = path.join(tempDir, `frolic-emergency-${timestamp}.json`);
+                    fs.writeFileSync(tempBackupPath, JSON.stringify(backupData, null, 2), 'utf8');
+                    console.log(`[FROLIC] ✅ Temp backup: ${tempBackupPath} created`);
         } catch (err) {
-            console.error('[FROLIC] Failed to prepare final digest:', err);
+                    console.warn('[FROLIC] Temp backup failed (non-critical):', err);
+                }
+            }
+            
+            // 4. Extension storage backup
+            if (extensionContext) {
+                const storageBackup = {
+                    timestamp: new Date().toISOString(),
+                    sessionId: sessionId,
+                    eventCount: LOG_BUFFER.length,
+                    events: LOG_BUFFER.slice(-1000), // Keep last 1000 events
+                    metadata: {
+                        version: '1.3.0',
+                        trigger: 'deactivation-storage',
+                        truncated: LOG_BUFFER.length > 1000
+                    }
+                };
+                
+                extensionContext.globalState.update('frolic.smartBackup', storageBackup);
+                console.log('[FROLIC] ✅ Extension storage backup updated');
+            }
+            
+            console.log('[FROLIC] 🔄 Smart backup system: Data recovery will restore these events on next startup');
+            
+        } catch (err) {
+            console.error('[FROLIC] ❌ Final backup creation failed:', err);
         }
+    } else {
+        console.log('[FROLIC] No unsent events to backup');
     }
     
     // Clear the buffer to free memory
     LOG_BUFFER.length = 0;
     bufferMemoryUsage = 0;
     
-    console.log('🛑 Frolic Logger deactivated.');
+    console.log('🛑 Frolic Logger deactivated with smart backup system protection.');
 }
 
 // Helper for SecretStorage access - DEPRECATED
@@ -1250,7 +2087,7 @@ function startPeriodicDigestSending(context: vscode.ExtensionContext) {
     if (LOG_BUFFER.length > 0) {
         console.log(`[FROLIC] Found ${LOG_BUFFER.length} events from previous session, sending initial digest`);
         // Don't block startup - send in background
-        sendDigestImmediately(context).catch(err => {
+        sendDigestImmediately(context, 3, true).catch(err => { // Show notification for recovered data
             console.log('[FROLIC] Initial digest send failed, will retry on next interval');
         });
     }
@@ -1259,19 +2096,22 @@ function startPeriodicDigestSending(context: vscode.ExtensionContext) {
         // Add some jitter to prevent thundering herd if many users have same interval
         const jitter = Math.random() * 60000; // 0-1 minute random delay
         setTimeout(async () => {
-            await sendDigestImmediately(context);
+            await sendDigestImmediately(context, 3, true); // Show notification for periodic digests
         }, jitter);
     }, intervalMs);
 
     console.log(`[FROLIC] Periodic digest timer started (every ${frequencyHours} hours)`);
 }
 
-async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetries: number = 3): Promise<number> {
+async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetries: number = 3, showNotification: boolean = true): Promise<number> {
     if (LOG_BUFFER.length > 0) {
         const eventCount = LOG_BUFFER.length; // Capture count before clearing
         console.log(`[FROLIC] Sending digest with ${eventCount} events`);
         console.log(`[FROLIC] Sample events:`, LOG_BUFFER.slice(0, 3)); // Show first 3 events for debugging
         updateStatusBar('sending');
+        
+        // 🔄 PHASE 1.3: Smart backup before digest sending
+        await createSmartBackup('pre-digest-send', true);
         
         const digest = analyzeLogs(LOG_BUFFER);
         let lastError: Error | null = null;
@@ -1287,6 +2127,30 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 sessionId = crypto.randomUUID();
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
                 updateStatusBar('authenticated');
+                
+                // 🔄 PHASE 2.1: Smart notification throttling
+                digestsSentSinceLastNotification++;
+                const timeSinceLastNotification = Date.now() - lastNotificationTime;
+                const notificationThrottleMs = getNotificationThrottleMs();
+                const shouldShowNotification = showNotification && (
+                    lastNotificationTime === 0 || // First notification ever
+                    timeSinceLastNotification >= notificationThrottleMs || // Configurable hours since last
+                    digestsSentSinceLastNotification >= 10 // Or 10+ digests sent (fallback)
+                );
+                
+                if (shouldShowNotification) {
+                    const message = digestsSentSinceLastNotification > 1 
+                        ? `✅ Digest sent successfully! (${digestsSentSinceLastNotification} sessions processed)`
+                        : `✅ Digest sent successfully! (${eventCount} events processed)`;
+                    
+                    vscode.window.showInformationMessage(message);
+                    lastNotificationTime = Date.now();
+                    digestsSentSinceLastNotification = 0; // Reset counter
+                } else {
+                    // Still log to console for debugging, but no popup
+                    console.log(`[FROLIC] 🔇 Digest sent silently (${eventCount} events, ${digestsSentSinceLastNotification} total since last notification)`);
+                }
+                
                 return eventCount; // Return the number of events processed
             } catch (err: any) {
                 lastError = err;
@@ -1352,7 +2216,7 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'unauthenticated':
             statusBarItem.text = '$(sign-in) Sign in to Frolic';
-            statusBarItem.tooltip = 'Frolic: Sign in to enable cloud sync and get personalized recaps';
+            statusBarItem.tooltip = 'Frolic: Click to sign in';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
             statusBarItem.command = 'frolic.signIn';
             break;
@@ -1364,7 +2228,7 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'error':
             statusBarItem.text = '$(error) Frolic';
-            statusBarItem.tooltip = 'Frolic: Connection error. Click to retry.';
+            statusBarItem.tooltip = 'Frolic: Connection error. Click to sign in.';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
             statusBarItem.command = 'frolic.signIn';
             break;
@@ -1723,6 +2587,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         const accessToken = await getValidAccessToken(this.context);
         const status = accessToken ? 'authenticated' : 'unauthenticated';
         const label = status === 'authenticated' ? `✅ Signed in` : '❌ Not signed in';
+        
         return [
             new FrolicTreeItem(
                 label,
@@ -1753,3 +2618,175 @@ class FrolicTreeItem extends vscode.TreeItem {
         }
     }
 }
+
+/**
+ * Send a session digest to your backend.
+ * @param sessionId string (UUID)
+ * @param digest object (summary)
+ * @param context vscode.ExtensionContext for accessing secrets
+ */
+export async function sendDigestToBackend(
+  sessionId: string,
+  digest: any,
+  context: vscode.ExtensionContext
+) {
+  const apiBaseUrl = getApiBaseUrl();
+  const apiUrl = `${apiBaseUrl}/api/digests`;
+  console.log(`[FROLIC] Sending digest to: ${apiUrl}`);
+  
+  // Try to get a valid access token (will refresh if needed)
+  const accessToken = await getValidAccessToken(context);
+  
+  if (!accessToken) {
+    console.log('[FROLIC] No valid access token available, skipping digest upload');
+    throw new Error('NO_AUTH_TOKEN');
+  }
+
+  console.log(`[FROLIC] Using access token: ${accessToken?.substring(0, 20)}...`);
+  console.log(`[FROLIC] Token expires at: ${getTokenExpirationTime(accessToken)}`);
+
+  try {
+    const res = await fetchWithTimeout(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+      },
+      body: JSON.stringify({ sessionId, digest })
+    }, 30000); // 30 second timeout
+
+    if (!res.ok) {
+      const errorText = await res.text();
+      
+      // Handle specific HTTP status codes
+      if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
+        // Backend rejected token - but let's debug WHY before deleting it
+        console.log('[FROLIC] Backend rejected token with 401/403:', {
+          status: res.status,
+          error: errorText,
+          tokenLength: accessToken.length,
+          tokenExpiry: getTokenExpirationTime(accessToken),
+          isLocallyExpired: isTokenExpired(accessToken)
+        });
+        
+        // Only delete token if it's actually expired locally, OR if backend specifically says "token is expired"
+        const shouldDeleteToken = isTokenExpired(accessToken) || errorText.includes('token is expired');
+        
+        if (shouldDeleteToken) {
+          await context.secrets.delete('frolic.accessToken');
+          console.log('[FROLIC] Token expired, cleared stored token');
+        } else {
+          console.log('[FROLIC] Token appears valid locally but backend rejected it - investigating...');
+          
+          // Test the token directly with backend debug endpoint
+          try {
+            const debugUrl = `${apiBaseUrl}/api/auth/debug-token`;
+            const debugRes = await fetchWithTimeout(debugUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+              },
+              body: JSON.stringify({ access_token: accessToken })
+            }, 10000);
+            
+            const debugData = await debugRes.json();
+            console.log('[FROLIC] Backend token debug result:', debugData);
+            
+            if (!debugData.valid) {
+              console.log('[FROLIC] Backend confirms token is invalid, clearing it');
+              await context.secrets.delete('frolic.accessToken');
+            } else {
+              console.log('[FROLIC] Backend says token is valid but digest endpoint rejected it - backend inconsistency!');
+            }
+          } catch (debugErr) {
+            console.log('[FROLIC] Could not debug token with backend:', debugErr);
+          }
+        }
+        
+        // Try to refresh token and retry the request once
+        const newToken = await getValidAccessToken(context);
+        if (newToken && newToken !== accessToken) { // Ensure we got a different token
+          console.log('[FROLIC] Token refreshed, retrying digest upload...');
+          console.log(`[FROLIC] Old token: ${accessToken.substring(0, 30)}...`);
+          console.log(`[FROLIC] New token: ${newToken.substring(0, 30)}...`);
+          console.log(`[FROLIC] New token expires: ${getTokenExpirationTime(newToken)}`);
+          
+          // Retry the request with new token
+          const retryRes = await fetchWithTimeout(apiUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${newToken}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+            },
+            body: JSON.stringify({ sessionId, digest })
+          }, 30000);
+          
+          if (retryRes.ok) {
+            console.log('[FROLIC] Digest uploaded successfully after token refresh');
+            return await retryRes.json();
+          } else {
+            const retryErrorText = await retryRes.text();
+            console.log(`[FROLIC] Retry after token refresh failed: ${retryRes.status} ${retryErrorText}`);
+            
+            // If the refreshed token also fails, clear everything and force re-authentication
+            if (retryRes.status === 401) {
+              console.log('[FROLIC] Refreshed token also rejected - clearing all auth state');
+              await clearAllAuthTokens(context);
+              updateStatusBar('unauthenticated');
+              
+              // Automatically prompt user to re-authenticate
+              const selection = await vscode.window.showWarningMessage(
+                '🔐 Frolic: Authentication expired. Please sign in again to continue sending digests.',
+                'Sign In Now',
+                'Later'
+              );
+              
+              if (selection === 'Sign In Now') {
+                // Small delay to ensure UI is ready
+                setTimeout(() => {
+                  vscode.commands.executeCommand('frolic.signIn');
+                }, 500);
+              }
+            }
+            throw new Error('AUTH_TOKEN_EXPIRED');
+          }
+        } else {
+          console.log('[FROLIC] Could not refresh token or got same token back');
+          await clearAllAuthTokens(context);
+          updateStatusBar('unauthenticated');
+          throw new Error('AUTH_TOKEN_EXPIRED');
+        }
+      } else if (res.status === 403) {
+        console.error('[FROLIC] Access forbidden - check API permissions');
+        throw new Error('ACCESS_FORBIDDEN');
+      } else if (res.status >= 500) {
+        console.error(`[FROLIC] Server error: ${res.status} ${errorText}`);
+        throw new Error('SERVER_ERROR');
+      } else {
+        console.error(`[FROLIC] Client error: ${res.status} ${errorText}`);
+        throw new Error('CLIENT_ERROR');
+      }
+    }
+
+    // Success
+    console.log('[FROLIC] Digest uploaded successfully');
+    return await res.json();
+  } catch (err: any) {
+    // Handle different types of errors appropriately
+    if (err.name === 'AbortError' || err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+      console.log('[FROLIC] Network unavailable, will retry later');
+      throw new Error('NETWORK_ERROR');
+    } else if (err.message === 'NO_AUTH_TOKEN' || err.message === 'AUTH_TOKEN_EXPIRED') {
+      // Re-throw auth errors as-is
+      throw err;
+    } else {
+      console.error('[FROLIC] Unexpected error sending digest:', err);
+      throw new Error('UNKNOWN_ERROR');
+    }
+  }
+}
+
