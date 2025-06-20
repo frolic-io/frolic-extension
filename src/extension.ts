@@ -3319,41 +3319,9 @@ export async function sendDigestToBackend(
           isLocallyExpired: isTokenExpired(accessToken)
         });
         
-        // Only delete token if it's actually expired locally, OR if backend specifically says "token is expired"
-        const shouldDeleteToken = isTokenExpired(accessToken) || errorText.includes('token is expired');
-        
-        if (shouldDeleteToken) {
-          await context.secrets.delete('frolic.accessToken');
-          console.log('[FROLIC] Token expired, cleared stored token');
-        } else {
-          console.log('[FROLIC] Token appears valid locally but backend rejected it - investigating...');
-          
-          // Test the token directly with backend debug endpoint
-          try {
-            const debugUrl = `${apiBaseUrl}/api/auth/debug-token`;
-            const debugRes = await fetchWithTimeout(debugUrl, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
-              },
-              body: JSON.stringify({ access_token: accessToken })
-            }, 10000);
-            
-            const debugData = await debugRes.json();
-            console.log('[FROLIC] Backend token debug result:', debugData);
-            
-            if (!debugData.valid) {
-              console.log('[FROLIC] Backend confirms token is invalid, clearing it');
-              await context.secrets.delete('frolic.accessToken');
-            } else {
-              console.log('[FROLIC] Backend says token is valid but digest endpoint rejected it - backend inconsistency!');
-            }
-          } catch (debugErr) {
-            console.log('[FROLIC] Could not debug token with backend:', debugErr);
-          }
-        }
+        // Always clear the token when backend returns 401 - it's either expired or invalid
+        console.log('[FROLIC] Backend returned 401 - clearing stored token to force refresh');
+        await context.secrets.delete('frolic.accessToken');
         
         // Try to refresh token and retry the request once
         const newToken = await getValidAccessToken(context);
@@ -3384,19 +3352,9 @@ export async function sendDigestToBackend(
               await clearAllAuthTokens(context);
               updateStatusBar('unauthenticated');
               
-              // Automatically prompt user to re-authenticate
-              const selection = await vscode.window.showWarningMessage(
-                '🔐 Frolic: Authentication expired. Please sign in again to continue sending digests.',
-                'Sign In Now',
-                'Later'
-              );
-              
-              if (selection === 'Sign In Now') {
-                // Small delay to ensure UI is ready
-                setTimeout(() => {
-                  vscode.commands.executeCommand('frolic.signIn');
-                }, 500);
-              }
+              // Don't automatically prompt - this was causing the loop!
+              // Just update status bar and let user manually sign in
+              console.log('[FROLIC] Authentication expired. User will need to manually sign in.');
             }
             throw new Error('AUTH_TOKEN_EXPIRED');
           }

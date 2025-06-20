@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {
@@ -94,7 +94,7 @@
         },
         "frolic.apiBaseUrl": {
           "type": "string",
-          "default": "https://www.getfrolic.io",
+          "default": "https://getfrolic.io",
           "description": "Base URL for Frolic API endpoints."
         },
         "frolic.digestFrequencyHours": {
