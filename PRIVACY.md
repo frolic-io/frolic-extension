@@ -1,23 +1,49 @@
 # Privacy Policy
 
-**Effective Date:** March 19, 2024  
+**Effective Date:** June 20, 2025  
 **Applies to:** Frolic VS Code Extension and related services
 
 ---
 
 ## 📋 What We Collect
 
-- **Activity Data** – File edits, cursor movement, command usage, etc.
-- **Profile Data** – Email, name, role, company (if shared during onboarding)
-- **Technical Data** – OS, extension version, VS Code version
+### Coding Activity Data (Only with Sign-in)
+- **File operations**: Open, close, save, edit events with timestamps
+- **Learning behavior patterns**: 
+  - Undo/redo sequences for struggle detection
+  - Timing patterns and pauses in coding activity
+  - File switching patterns and context switching behavior
+  - Error and debugging patterns via VS Code diagnostic events
+- **AI collaboration patterns**: Detection of AI-assisted coding and refinement patterns
+- **Session data**: Coding session duration, intensity, and productivity metrics
+- **Technical metadata**: Programming languages, project structure, file types
+
+### Profile Data (Optional)
+- **Email, name, role, company** (if shared during onboarding)
+
+### Technical Data
+- **OS, extension version, VS Code version** for compatibility and debugging
 
 ---
 
 ## 🔍 How We Use It
 
-- To generate your **personalized weekly summaries**
-- To recommend relevant **learning resources**
-- To improve the extension’s performance and usability
+### For Personalized Learning Insights
+- Generate **personalized weekly coding summaries** with learning progression analysis
+- Detect **learning struggle patterns** to provide targeted educational support
+- Analyze **AI collaboration effectiveness** to improve your human-AI coding workflow
+- Track **skill development progression** across different programming concepts
+- Identify **optimal coding patterns** and productivity recommendations
+
+### For Service Improvement
+- Improve extension performance and usability through anonymous usage analytics
+- Enhance AI-powered content generation based on coding pattern effectiveness
+- Develop better learning detection algorithms
+
+### What We DON'T Use It For
+- ❌ We never analyze or access your actual code content
+- ❌ We don't share individual user data with third parties
+- ❌ We don't use your data for advertising or marketing to external companies
 
 ---
 

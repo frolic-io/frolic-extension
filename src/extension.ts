@@ -39,6 +39,40 @@ let digestsSentSinceLastNotification = 0;
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
 const TOKEN_REFRESH_CHECK_INTERVAL = 30 * 60 * 1000; // Check every 30 minutes
 
+// 🔄 PHASE 2.2: Learning Struggle Detection - Global state
+let userActionHistory: Array<{
+    timestamp: number;
+    action: 'undo' | 'redo' | 'pause' | 'file_switch' | 'error_fix' | 'rapid_edit';
+    context?: any;
+}> = [];
+let pauseStartTime: number | null = null;
+let lastSignificantAction: number = Date.now();
+let recentFileOpenings: Array<{ file: string; timestamp: number }> = [];
+let undoRedoSequence: Array<{ timestamp: number; type: 'undo' | 'redo' }> = [];
+
+// 🔄 PHASE 2.3: Error and Debugging Tracking - Global state
+let diagnosticHistory: Array<{
+    timestamp: number;
+    uri: string;
+    diagnostics: vscode.Diagnostic[];
+    eventType: 'added' | 'removed' | 'changed';
+}> = [];
+let activeErrorSessions: Map<string, {
+    startTime: number;
+    errorCount: number;
+    errorTypes: string[];
+    lastErrorTimestamp: number;
+}> = new Map();
+let previousDiagnostics: Map<string, vscode.Diagnostic[]> = new Map();
+
+// Thresholds for struggle detection
+const RAPID_UNDO_REDO_THRESHOLD = 5; // 5 undo/redo actions within 30 seconds
+const RAPID_UNDO_REDO_TIME_WINDOW = 30 * 1000; // 30 seconds
+const LONG_PAUSE_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+const FREQUENT_SWITCHING_THRESHOLD = 8; // 8 file switches within 2 minutes
+const FREQUENT_SWITCHING_TIME_WINDOW = 2 * 60 * 1000; // 2 minutes
+const ERROR_HEAVY_SESSION_THRESHOLD = 10; // 10+ errors in a file
+
 function getNotificationThrottleMs(): number {
     const config = vscode.workspace.getConfiguration('frolic');
     const hours = config.get<number>('notificationFrequencyHours', 2);
@@ -52,6 +86,197 @@ function getBufferLimits() {
         maxBufferSize: config.get<number>('maxBufferSize', 10000),
         maxMemoryMB: config.get<number>('maxMemoryMB', 50)
     };
+}
+
+// 🔄 PHASE 2.2: Learning Struggle Detection Helper Functions
+
+function logStruggleEvent(eventType: string, data: any) {
+    logEvent('struggle_indicator', {
+        ...data,
+        struggleType: eventType,
+        sessionContext: getCurrentSessionContext(),
+        timestamp: new Date().toISOString()
+    });
+}
+
+function getCurrentSessionContext(): any {
+    const activeEditor = vscode.window.activeTextEditor;
+    return {
+        activeFile: activeEditor?.document.fileName,
+        language: activeEditor?.document.languageId,
+        lineCount: activeEditor?.document.lineCount,
+        cursorPosition: activeEditor?.selection.active,
+        recentFiles: recentFileOpenings.slice(-3).map(f => f.file)
+    };
+}
+
+function detectRapidUndoRedo(timestamp: number, type: 'undo' | 'redo') {
+    // Clean old entries
+    const cutoff = timestamp - RAPID_UNDO_REDO_TIME_WINDOW;
+    undoRedoSequence = undoRedoSequence.filter(entry => entry.timestamp > cutoff);
+    
+    // Add current action
+    undoRedoSequence.push({ timestamp, type });
+    
+    // Check if we've exceeded the threshold
+    if (undoRedoSequence.length >= RAPID_UNDO_REDO_THRESHOLD) {
+        logStruggleEvent('rapid_undo_redo', {
+            sequenceLength: undoRedoSequence.length,
+            timeSpan: timestamp - undoRedoSequence[0].timestamp,
+            pattern: undoRedoSequence.map(s => s.type).join('->'),
+            context: getCurrentSessionContext()
+        });
+        
+        // Reset to avoid duplicate detection
+        undoRedoSequence = [];
+    }
+}
+
+function detectLongPause(timestamp: number) {
+    const pauseDuration = timestamp - lastSignificantAction;
+    
+    if (pauseDuration > LONG_PAUSE_THRESHOLD) {
+        logStruggleEvent('long_pause', {
+            duration: pauseDuration,
+            durationMinutes: Math.round(pauseDuration / 60000),
+            context: getCurrentSessionContext()
+        });
+    }
+}
+
+function detectFrequentFileSwitching(fileName: string, timestamp: number) {
+    // Clean old entries
+    const cutoff = timestamp - FREQUENT_SWITCHING_TIME_WINDOW;
+    recentFileOpenings = recentFileOpenings.filter(entry => entry.timestamp > cutoff);
+    
+    // Add current opening
+    recentFileOpenings.push({ file: fileName, timestamp });
+    
+    // Check if we've exceeded the threshold
+    if (recentFileOpenings.length >= FREQUENT_SWITCHING_THRESHOLD) {
+        const uniqueFiles = new Set(recentFileOpenings.map(f => f.file));
+        
+        logStruggleEvent('frequent_file_switching', {
+            switchCount: recentFileOpenings.length,
+            uniqueFiles: uniqueFiles.size,
+            timeSpan: timestamp - recentFileOpenings[0].timestamp,
+            files: Array.from(uniqueFiles),
+            context: getCurrentSessionContext()
+        });
+        
+        // Reset to avoid duplicate detection
+        recentFileOpenings = recentFileOpenings.slice(-3);
+    }
+}
+
+function cleanupOldStruggleData() {
+    const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours
+    
+    userActionHistory = userActionHistory.filter(entry => entry.timestamp > cutoff);
+    recentFileOpenings = recentFileOpenings.filter(entry => entry.timestamp > cutoff);
+    undoRedoSequence = undoRedoSequence.filter(entry => entry.timestamp > cutoff);
+}
+
+// 🔄 PHASE 2.3: Error and Debugging Tracking Helper Functions
+
+function categorizeError(diagnostic: vscode.Diagnostic): string {
+    const message = diagnostic.message.toLowerCase();
+    const code = diagnostic.code?.toString().toLowerCase() || '';
+    
+    if (message.includes('syntax') || message.includes('unexpected') || 
+        message.includes('parse') || code.includes('syntax')) {
+        return 'syntax';
+    } else if (message.includes('undefined') || message.includes('not found') || 
+               message.includes('cannot find') || message.includes('unresolved')) {
+        return 'reference';
+    } else if (message.includes('type') || message.includes('expected') || 
+               code.includes('type')) {
+        return 'type';
+    } else if (message.includes('import') || message.includes('module') || 
+               message.includes('require')) {
+        return 'import';
+    } else {
+        return 'logic';
+    }
+}
+
+function getDiagnosticChangeType(uri: vscode.Uri, currentDiagnostics: vscode.Diagnostic[]): 'added' | 'removed' | 'changed' {
+    const uriString = uri.toString();
+    const previous = previousDiagnostics.get(uriString) || [];
+    
+    if (previous.length === 0 && currentDiagnostics.length > 0) {
+        return 'added';
+    } else if (previous.length > 0 && currentDiagnostics.length === 0) {
+        return 'removed';
+    } else {
+        return 'changed';
+    }
+}
+
+function updateErrorSession(filePath: string, diagnostics: vscode.Diagnostic[]) {
+    const errors = diagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Error);
+    const warnings = diagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Warning);
+    const timestamp = Date.now();
+    
+    if (errors.length > 0 || warnings.length > 0) {
+        if (!activeErrorSessions.has(filePath)) {
+            activeErrorSessions.set(filePath, {
+                startTime: timestamp,
+                errorCount: 0,
+                errorTypes: [],
+                lastErrorTimestamp: timestamp
+            });
+        }
+        
+        const session = activeErrorSessions.get(filePath)!;
+        session.errorCount = errors.length;
+        session.errorTypes = errors.map(e => categorizeError(e));
+        session.lastErrorTimestamp = timestamp;
+        
+        // Check for error-heavy session
+        if (errors.length >= ERROR_HEAVY_SESSION_THRESHOLD) {
+            logStruggleEvent('error_heavy_session', {
+                file: filePath,
+                errorCount: errors.length,
+                warningCount: warnings.length,
+                errorTypes: session.errorTypes,
+                sessionDuration: timestamp - session.startTime,
+                context: getCurrentSessionContext()
+            });
+        }
+    } else {
+        // Session ended - log the debugging session
+        const session = activeErrorSessions.get(filePath);
+        if (session) {
+            const sessionDuration = timestamp - session.startTime;
+            
+            logEvent('debugging_session_end', {
+                file: filePath,
+                duration: sessionDuration,
+                durationMinutes: Math.round(sessionDuration / 60000),
+                maxErrorCount: session.errorCount,
+                errorTypes: session.errorTypes,
+                resolution: 'errors_cleared',
+                context: getCurrentSessionContext()
+            });
+            
+            activeErrorSessions.delete(filePath);
+        }
+    }
+}
+
+function cleanupOldErrorData() {
+    const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours
+    
+    diagnosticHistory = diagnosticHistory.filter(entry => entry.timestamp > cutoff);
+    
+    // Clean up stale error sessions (over 2 hours old)
+    const staleCutoff = Date.now() - (2 * 60 * 60 * 1000);
+    for (const [filePath, session] of activeErrorSessions.entries()) {
+        if (session.lastErrorTimestamp < staleCutoff) {
+            activeErrorSessions.delete(filePath);
+        }
+    }
 }
 
 function logEvent(eventType: string, data: any) {
@@ -97,6 +322,23 @@ function logEvent(eventType: string, data: any) {
 
     // 🔄 PHASE 1.3: Update activity tracking for smart backups
     lastActivityTime = Date.now();
+    
+    // 🔄 PHASE 2.2: Learning Struggle Detection
+    const now = Date.now();
+    if (eventType === 'file_edit' && data.changes && data.changes.length > 0) {
+        // Detect long pauses before significant edits
+        detectLongPause(now);
+        
+        // Update last significant action
+        lastSignificantAction = now;
+        
+        // Track rapid editing patterns
+        const changeText = data.changes.map((c: any) => c.changeText || '').join('');
+        if (changeText.includes('undo') || changeText.includes('redo')) {
+            const type = changeText.includes('undo') ? 'undo' : 'redo';
+            detectRapidUndoRedo(now, type);
+        }
+    }
 
     // Update estimated memory usage
     const entrySize = JSON.stringify(entry).length * 2; // Rough estimate: 2 bytes per character
@@ -166,6 +408,12 @@ function logEvent(eventType: string, data: any) {
 
     // Debug logging (removed environment detection)
     // console.log(`[FROLIC] ${eventType}`, entry);
+
+    // Update status bar to reflect current event count
+    // Only update if status bar is already in authenticated state
+    if (statusBarItem && statusBarItem.text.includes('$(check) Frolic')) {
+        updateStatusBar('authenticated');
+    }
 }
 
 function writeLogsToFile() {
@@ -687,7 +935,7 @@ function stopInactivityBackupTimer(): void {
 
 function getApiBaseUrl(): string {
   const config = vscode.workspace.getConfiguration('frolic');
-      const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.io';
+      const url = config.get<string>('apiBaseUrl') || 'https://www.getfrolic.io';
   
   // Log the URL for debugging
   console.log('[FROLIC] getApiBaseUrl() returning:', url);
@@ -839,9 +1087,7 @@ function isTokenExpired(token: string): boolean {
     }
     
     const timeUntilExpiry = payload.exp - now;
-    // 🔄 ENHANCED: Proactive refresh 1 hour before expiration
-    const PROACTIVE_REFRESH_BUFFER = 60 * 60; // 1 hour in seconds
-    const needsRefresh = timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER;
+    // 🔄 FIXED: Only treat as expired if actually expired, not proactively
     const isExpired = payload.exp < now;
     
     console.log('[FROLIC] Token validation check:', {
@@ -851,12 +1097,11 @@ function isTokenExpired(token: string): boolean {
       nowDate: new Date(now * 1000).toISOString(),
       timeUntilExpiry: timeUntilExpiry,
       timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 60),
-      needsProactiveRefresh: needsRefresh && !isExpired,
       isExpired: isExpired
     });
     
-    // Return true if expired OR needs proactive refresh
-    return isExpired || needsRefresh;
+    // Return true ONLY if actually expired
+    return isExpired;
   } catch (err) {
     console.log('[FROLIC] Error checking token expiration:', err);
     return true; // Assume expired if we can't parse
@@ -885,6 +1130,34 @@ function getTokenExpirationTime(token: string): string {
 }
 
 /**
+ * Check if token should be proactively refreshed (within 10 minutes of expiry)
+ */
+function shouldProactivelyRefreshToken(token: string): boolean {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    if (!payload.exp) return false;
+    
+    const now = Math.floor(Date.now() / 1000);
+    const timeUntilExpiry = payload.exp - now;
+    const PROACTIVE_REFRESH_BUFFER = 10 * 60; // 10 minutes in seconds
+    
+    // Only refresh if token expires within 10 minutes but is not yet expired
+    const needsProactiveRefresh = timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER && timeUntilExpiry > 0;
+    
+    if (needsProactiveRefresh) {
+      console.log('[FROLIC] Token expires in', Math.round(timeUntilExpiry / 60), 'minutes - scheduling proactive refresh');
+    }
+    
+    return needsProactiveRefresh;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
  * 🔄 ENHANCED: Background token refresh to prevent expiration
  */
 async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): Promise<void> {
@@ -897,14 +1170,24 @@ async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): 
       return;
     }
     
-    // Check if token needs refresh (proactive check)
+    // Check if token needs proactive refresh (within 10 minutes of expiry)
+    const shouldRefreshProactively = shouldProactivelyRefreshToken(accessToken);
+    
     if (isTokenExpired(accessToken)) {
-      console.log('[FROLIC] Background refresh: Token needs refresh, performing...');
+      console.log('[FROLIC] Background refresh: Token is expired, performing emergency refresh...');
       const newToken = await performTokenRefresh(context, refreshToken);
       if (newToken) {
-        console.log('[FROLIC] Background refresh: Successfully refreshed token');
+        console.log('[FROLIC] Background refresh: Successfully refreshed expired token');
       } else {
-        console.log('[FROLIC] Background refresh: Failed to refresh token');
+        console.log('[FROLIC] Background refresh: Failed to refresh expired token');
+      }
+    } else if (shouldRefreshProactively) {
+      console.log('[FROLIC] Background refresh: Token expires soon, performing proactive refresh...');
+      const newToken = await performTokenRefresh(context, refreshToken);
+      if (newToken) {
+        console.log('[FROLIC] Background refresh: Successfully refreshed token proactively');
+      } else {
+        console.log('[FROLIC] Background refresh: Failed proactive refresh, will retry later');
       }
     } else {
       console.log('[FROLIC] Background refresh: Token still valid, no refresh needed');
@@ -1307,6 +1590,112 @@ function analyzeLogs(logs: any[]): any {
       // Raw code samples for LLM analysis
       codeChangesSample: codeChangesSample,
       importStatements: Array.from(new Set(importStatements)).slice(0, 20),
+    
+    // 🔄 PHASE 2.2: Learning Struggle Detection Data
+    struggleIndicators: {
+      rapidUndoRedoCount: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'rapid_undo_redo').length,
+      longPauseCount: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'long_pause').length,
+      frequentSwitchingCount: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'frequent_file_switching').length,
+      errorHeavySessionCount: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'error_heavy_session').length,
+      totalStruggleEvents: logs.filter(l => l.eventType === 'struggle_indicator').length,
+      
+      // Detailed struggle patterns
+      struggleDetails: logs
+        .filter(l => l.eventType === 'struggle_indicator')
+        .map(l => ({
+          type: l.struggleType,
+          timestamp: l.timestamp,
+          context: l.sessionContext,
+          severity: l.struggleType === 'error_heavy_session' ? 'high' : 
+                   l.struggleType === 'rapid_undo_redo' ? 'medium' : 'low'
+        })),
+        
+      // Time-based struggle analysis
+      avgPauseDuration: (() => {
+        const pauses = logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'long_pause');
+        return pauses.length > 0 ? 
+          pauses.reduce((sum, p) => sum + (p.duration || 0), 0) / pauses.length : 0;
+      })(),
+      
+      maxConsecutiveFileSwitches: (() => {
+        const switches = logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'frequent_file_switching');
+        return switches.length > 0 ? Math.max(...switches.map(s => s.switchCount || 0)) : 0;
+      })()
+    },
+    
+    // 🔄 PHASE 2.3: Error and Debugging Tracking Data
+    errorTrackingData: {
+      diagnosticChangeCount: logs.filter(l => l.eventType === 'diagnostic_change').length,
+      totalErrorsEncountered: logs
+        .filter(l => l.eventType === 'diagnostic_change')
+        .reduce((sum, l) => sum + (l.errorCount || 0), 0),
+      totalWarningsEncountered: logs
+        .filter(l => l.eventType === 'diagnostic_change')
+        .reduce((sum, l) => sum + (l.warningCount || 0), 0),
+      
+      // Debugging session analysis
+      debuggingSessions: logs
+        .filter(l => l.eventType === 'debugging_session_end')
+        .map(l => ({
+          file: l.file,
+          duration: l.duration,
+          durationMinutes: l.durationMinutes,
+          maxErrorCount: l.maxErrorCount,
+          errorTypes: l.errorTypes,
+          resolution: l.resolution
+        })),
+      
+      // Error pattern analysis
+      errorPatternsByType: (() => {
+        const errors = logs.filter(l => l.eventType === 'diagnostic_change' && l.diagnostics);
+        const patterns: Record<string, number> = {};
+        
+        errors.forEach(l => {
+          (l.diagnostics || []).forEach((d: any) => {
+            if (d.category) {
+              patterns[d.category] = (patterns[d.category] || 0) + 1;
+            }
+          });
+        });
+        
+        return patterns;
+      })(),
+      
+      // Error resolution efficiency
+      avgDebuggingDuration: (() => {
+        const sessions = logs.filter(l => l.eventType === 'debugging_session_end');
+        return sessions.length > 0 ? 
+          sessions.reduce((sum, s) => sum + (s.duration || 0), 0) / sessions.length : 0;
+      })(),
+      
+      // Most problematic files
+      errorProneFiles: (() => {
+        const fileErrors: Record<string, number> = {};
+        
+        logs.filter(l => l.eventType === 'diagnostic_change').forEach(l => {
+          if (l.file && l.errorCount > 0) {
+            fileErrors[l.file] = (fileErrors[l.file] || 0) + l.errorCount;
+          }
+        });
+        
+        return Object.entries(fileErrors)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([file, count]) => ({ file, errorCount: count }));
+      })(),
+      
+      // Error progression over time
+      errorProgression: logs
+        .filter(l => l.eventType === 'diagnostic_change')
+        .map(l => ({
+          timestamp: l.timestamp,
+          file: l.file,
+          errorCount: l.errorCount || 0,
+          warningCount: l.warningCount || 0,
+          changeType: l.changeType
+        }))
+        .slice(-50) // Keep last 50 for analysis
+    },
       
       // Behavioral patterns (structural, not semantic)
       codingVelocity: sessionDuration > 0 ? Math.round(totalLinesAdded / sessionDuration) : 0,
@@ -1350,7 +1739,17 @@ function analyzeLogs(logs: any[]): any {
         'ai_collaboration_patterns',
         'ai_learning_progression',
         'ai_dependency_assessment',
-        'human_ai_balance_analysis'
+        'human_ai_balance_analysis',
+        // 🔄 PHASE 2.2: Struggle detection analysis
+        'struggle_pattern_identification',
+        'learning_difficulty_assessment',
+        'time_to_solution_analysis',
+        'cognitive_load_evaluation',
+        // 🔄 PHASE 2.3: Error tracking analysis
+        'error_pattern_recognition',
+        'debugging_efficiency_assessment',
+        'error_progression_analysis',
+        'problem_solving_methodology'
       ],
       
       // Provide context, not conclusions
@@ -1359,7 +1758,25 @@ function analyzeLogs(logs: any[]): any {
         isIntenseSession: logs.length > 100,
         isMultiFileSession: files.size > 5,
         hasLargeChanges: totalLinesAdded > 200,
-        showsAIUsage: aiInsertions > 0
+        showsAIUsage: aiInsertions > 0,
+        // 🔄 PHASE 2.2: Struggle indicators
+        hasStrugglePatterns: logs.some(l => l.eventType === 'struggle_indicator'),
+        hasFrequentPauses: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'long_pause').length > 2,
+        hasRapidEditing: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'rapid_undo_redo').length > 0,
+        hasFileSwitchingPattern: logs.filter(l => l.eventType === 'struggle_indicator' && l.struggleType === 'frequent_file_switching').length > 0,
+        // 🔄 PHASE 2.3: Error indicators
+        hasErrorsEncountered: logs.some(l => l.eventType === 'diagnostic_change' && (l.errorCount || 0) > 0),
+        hasDebuggingSessions: logs.some(l => l.eventType === 'debugging_session_end'),
+        hasErrorHeavySessions: logs.some(l => l.eventType === 'struggle_indicator' && l.struggleType === 'error_heavy_session'),
+        hasComplexErrorPatterns: (() => {
+          const errorTypes = new Set();
+          logs.filter(l => l.eventType === 'diagnostic_change' && l.diagnostics).forEach(l => {
+            (l.diagnostics || []).forEach((d: any) => {
+              if (d.category) errorTypes.add(d.category);
+            });
+          });
+          return errorTypes.size > 2; // Multiple error types indicate complexity
+        })()
       },
 
       // 🔄 PHASE 2.1: Enhanced AI collaboration context
@@ -1870,6 +2287,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // Track file opens
     context.subscriptions.push(
         vscode.workspace.onDidOpenTextDocument((doc) => {
+            const timestamp = Date.now();
+            
             logEvent('file_open', {
                 file: doc.fileName,
                 language: doc.languageId,
@@ -1877,6 +2296,11 @@ export async function activate(context: vscode.ExtensionContext) {
                 isUntitled: doc.isUntitled,
                 isDirty: doc.isDirty
             });
+            
+            // 🔄 PHASE 2.2: Track file opening for struggle detection
+            if (doc.fileName && !doc.fileName.includes('.git')) {
+                detectFrequentFileSwitching(doc.fileName, timestamp);
+            }
         })
     );
 
@@ -2027,7 +2451,30 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(signOutCmd);
 
     // Register debug command for troubleshooting (can be triggered from status bar)
-
+    const debugCmd = vscode.commands.registerCommand('frolic.debug', async () => {
+        const accessToken = await getValidAccessToken(context);
+        const tokenInfo = accessToken ? 'Valid' : 'Missing/Invalid';
+        
+        vscode.window.showInformationMessage(
+            `🔍 Frolic Debug Info:\n` +
+            `• Buffer: ${LOG_BUFFER.length} events\n` +
+            `• Memory: ${Math.round(bufferMemoryUsage / 1024)}KB\n` +
+            `• Auth: ${tokenInfo}\n` +
+            `• Session: ${sessionId.substring(0, 8)}...`,
+            'View Buffer',
+            'Test Send'
+        ).then(selection => {
+            if (selection === 'View Buffer') {
+                writeLogsToFile();
+                vscode.commands.executeCommand('vscode.open', vscode.Uri.file(
+                    path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', '.frolic-log.json')
+                ));
+            } else if (selection === 'Test Send') {
+                vscode.commands.executeCommand('frolic.sendDigest');
+            }
+        });
+    });
+    context.subscriptions.push(debugCmd);
 
     // 🔄 PHASE 1.3: Start smart backup system
     startPeriodicBackup();
@@ -2046,6 +2493,119 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // 🔄 PHASE 2.2: Learning Struggle Detection Event Listeners
+    console.log('[FROLIC] 🔄 Initializing Phase 2.2: Learning Struggle Detection...');
+    
+    // Track text editor selection changes for pause detection
+    context.subscriptions.push(
+        vscode.window.onDidChangeTextEditorSelection(event => {
+            const now = Date.now();
+            
+            // Detect long pauses
+            if (now - lastSignificantAction > LONG_PAUSE_THRESHOLD) {
+                detectLongPause(now);
+            }
+            
+            // Update last significant action
+            lastSignificantAction = now;
+        })
+    );
+    
+    // Enhanced file opening tracking for frequent switching detection
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(editor => {
+            if (editor && editor.document.fileName) {
+                const now = Date.now();
+                detectFrequentFileSwitching(editor.document.fileName, now);
+                
+                // Log file switch action
+                userActionHistory.push({
+                    timestamp: now,
+                    action: 'file_switch',
+                    context: {
+                        fileName: editor.document.fileName,
+                        language: editor.document.languageId
+                    }
+                });
+            }
+        })
+    );
+    
+    // Track undo/redo commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('frolic.trackUndo', () => {
+            detectRapidUndoRedo(Date.now(), 'undo');
+        })
+    );
+    
+    context.subscriptions.push(
+        vscode.commands.registerCommand('frolic.trackRedo', () => {
+            detectRapidUndoRedo(Date.now(), 'redo');
+        })
+    );
+
+    // 🔄 PHASE 2.3: Error and Debugging Tracking Event Listeners
+    console.log('[FROLIC] 🔄 Initializing Phase 2.3: Error and Debugging Tracking...');
+    
+    // Main diagnostic change listener
+    context.subscriptions.push(
+        vscode.languages.onDidChangeDiagnostics(event => {
+            event.uris.forEach(uri => {
+                const currentDiagnostics = vscode.languages.getDiagnostics(uri);
+                const timestamp = Date.now();
+                const filePath = uri.fsPath;
+                
+                // Skip if it's a git file or other excluded path
+                if (filePath.includes('.git') || filePath.startsWith('git/')) {
+                    return;
+                }
+                
+                // Determine change type
+                const changeType = getDiagnosticChangeType(uri, currentDiagnostics);
+                
+                // Log the diagnostic change
+                logEvent('diagnostic_change', {
+                    file: filePath,
+                    diagnosticCount: currentDiagnostics.length,
+                    errorCount: currentDiagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Error).length,
+                    warningCount: currentDiagnostics.filter(d => d.severity === vscode.DiagnosticSeverity.Warning).length,
+                    changeType: changeType,
+                    diagnostics: currentDiagnostics.slice(0, 10).map(d => ({ // Limit to first 10 to avoid memory issues
+                        severity: d.severity,
+                        code: d.code?.toString() || '',
+                        message: d.message.substring(0, 200), // Truncate message
+                        category: categorizeError(d),
+                        range: {
+                            start: { line: d.range.start.line, character: d.range.start.character },
+                            end: { line: d.range.end.line, character: d.range.end.character }
+                        }
+                    }))
+                });
+                
+                // Update error session tracking
+                updateErrorSession(filePath, currentDiagnostics);
+                
+                // Store current diagnostics for next comparison
+                previousDiagnostics.set(uri.toString(), [...currentDiagnostics]);
+                
+                // Add to diagnostic history
+                diagnosticHistory.push({
+                    timestamp,
+                    uri: filePath,
+                    diagnostics: currentDiagnostics,
+                    eventType: changeType
+                });
+            });
+        })
+    );
+    
+    // Periodic cleanup for struggle and error data
+    const cleanupInterval = setInterval(() => {
+        cleanupOldStruggleData();
+        cleanupOldErrorData();
+    }, 60 * 60 * 1000); // Every hour
+    context.subscriptions.push({ dispose: () => clearInterval(cleanupInterval) });
 
     // Start daily digest sending (with recovered data if any)
     startPeriodicDigestSending(context);

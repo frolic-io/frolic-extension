@@ -108,3 +108,12 @@ Thumbs.db
 
 # Deployment scripts (may contain sensitive tokens/info)
 scripts/deploy.sh
+
+# Test scripts (development/debugging only)
+install-fixed-extension.sh
+scripts/test-ai-collaboration-patterns.js
+scripts/test-break-patterns.js
+scripts/test-notification-throttling.js
+scripts/test-session-detection.js
+scripts/test-session-recovery.js
+scripts/test-smart-backup-system.js

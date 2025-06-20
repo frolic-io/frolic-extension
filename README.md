@@ -8,14 +8,23 @@ Personalized vibe-learning newsletter powered by your coding sessions — learn 
 - **Real-time Activity Panel**: View your coding session stats, file changes, and productivity metrics right in VS Code's sidebar
 - **Session Tracking**: Monitor your current coding session duration and activity levels
 - **File & Language Analytics**: See which files and programming languages you're working with most
+- **Learning Pattern Detection**: Track coding behavior patterns including:
+  - Struggle indicators (rapid undo/redo, long pauses)
+  - Error and debugging patterns (via VS Code diagnostics)
+  - AI collaboration patterns (detection of AI-assisted coding)
 - **Event Buffering**: Track coding events with visual indicators for digest readiness
 - **Local Data Export**: Export your coding activity to JSON files for personal analysis
 
 ### 🎯 **Enhanced Features (Sign-in Required)**
 - **Personalized Coding Recaps**: Get AI-powered insights about your coding journey delivered to your inbox
 - **Smart Digest Generation**: Automatically curated summaries of your coding patterns and achievements
+- **Learning Analytics**: Advanced insights including:
+  - Struggle pattern analysis and learning difficulty detection
+  - Error resolution progression tracking
+  - AI collaboration effectiveness measurements
+  - Conceptual learning progression analysis
 - **Cross-session Analytics**: Track progress across multiple coding sessions and projects
-- **Newsletter Delivery**: Receive weekly insights tailored to your unique coding style
+- **Newsletter Delivery**: Receive daily insights tailored to your unique coding style and learning patterns
 
 ### 🔒 **Privacy & Control**
 - **Privacy-First Design**: All data stays local until you explicitly sign in and opt-in
@@ -87,6 +96,21 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 
 ## 🗒️ Release Notes
 
+### 1.0.16 (December 2024) 🆕
+
+- **Learning Struggle Detection**: Track rapid undo/redo patterns, long pauses, and frequent file switching
+- **Error and Debugging Analytics**: Monitor VS Code diagnostic events and error resolution patterns
+- **Enhanced AI Collaboration Tracking**: Improved detection of AI-assisted coding and refinement patterns
+- **Advanced Session Intelligence**: Better session boundary detection and coding pattern analysis
+- **Complete Educational Data Capture**: Comprehensive behavioral analysis for personalized learning insights
+
+### 1.0.15
+
+- Enhanced notification UX with reduced frequency
+- Advanced token management with proactive refresh
+- Beautiful email templates with dark theme design
+- Automated daily digest processing
+
 ### 1.0.0
 
 - Initial release with comprehensive activity logging
@@ -103,13 +127,30 @@ None at the moment! If you encounter any issues, please report them at our [GitH
 ### What We Collect (Only When You Sign In)
 - **File activity**: Which files you edit, programming languages used, lines of code changed
 - **Coding patterns**: When you code, how long you spend on different files, project structure
+- **Learning behavior patterns**: 
+  - Rapid undo/redo sequences (struggle detection)
+  - Long pauses between coding actions (thinking time analysis)
+  - Frequent file switching patterns (context switching behavior)
+  - Error and debugging patterns (diagnostic events from VS Code)
+- **AI collaboration patterns**: Detection of AI-assisted code generation and human refinement patterns
+- **Session characteristics**: Coding session duration, intensity, and focus patterns
 - **No personal code**: We never collect the actual content of your code, only metadata about your activity
 - **Account info**: Name and email address (only if you sign up for coding recaps)
 
+### Specific Events We Track
+- **File operations**: Open, close, save, edit events
+- **VS Code diagnostics**: Error/warning events (not the error content, just patterns)
+- **Timing patterns**: Pauses between actions, session duration, editing intensity
+- **Undo/redo actions**: Frequency and patterns (struggle detection)
+- **File switching**: Context switching behavior between files
+- **AI detection**: Patterns suggesting AI-assisted code generation
+- **Window focus**: When VS Code gains/loses focus for session boundary detection
+
 ### What We DON'T Collect
 - ❌ **Actual code content** - Your code never leaves your machine
-- ❌ **Keystrokes or cursor movements** - We don't track what you type or where you click
+- ❌ **Keystrokes or specific text** - We don't track what you type, only that you typed
 - ❌ **File contents** - Only file paths and metadata, never the actual code
+- ❌ **Error message content** - Only that errors occurred, not what they said
 - ❌ **Personal information** - Beyond name/email for signed-in users
 - ❌ **Sensitive data** - No passwords, API keys, or confidential information
 
