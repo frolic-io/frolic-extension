@@ -65,6 +65,21 @@ let activeErrorSessions: Map<string, {
 }> = new Map();
 let previousDiagnostics: Map<string, vscode.Diagnostic[]> = new Map();
 
+// Diagnostic logging throttle to prevent LOG_BUFFER flooding
+let lastDiagnosticLogTime: Map<string, number> = new Map();
+const DIAGNOSTIC_LOG_THROTTLE_MS = 10 * 1000; // Only log diagnostics every 10 seconds per file
+
+// Clean up old diagnostic throttle entries periodically
+function cleanupDiagnosticThrottle() {
+    const now = Date.now();
+    const cutoff = now - DIAGNOSTIC_LOG_THROTTLE_MS * 2; // Clean entries older than 20 seconds
+    for (const [filePath, lastTime] of lastDiagnosticLogTime) {
+        if (lastTime < cutoff) {
+            lastDiagnosticLogTime.delete(filePath);
+        }
+    }
+}
+
 // Thresholds for struggle detection
 const RAPID_UNDO_REDO_THRESHOLD = 5; // 5 undo/redo actions within 30 seconds
 const RAPID_UNDO_REDO_TIME_WINDOW = 30 * 1000; // 30 seconds
@@ -881,6 +896,9 @@ function startPeriodicBackup(): void {
         if (timeSinceLastActivity < 10 * 60 * 1000) {
             await createSmartBackup('periodic-5min');
         }
+        
+        // Clean up diagnostic throttle map to prevent memory leaks
+        cleanupDiagnosticThrottle();
     }, BACKUP_INTERVAL_MS);
     
     console.log('[FROLIC] ⏰ Periodic backup timer started (every 5 minutes)');
@@ -2445,10 +2463,18 @@ export async function activate(context: vscode.ExtensionContext) {
                     return;
                 }
                 
+                // 🔧 FIX: Throttle diagnostic logging to prevent LOG_BUFFER flooding
+                const lastLogTime = lastDiagnosticLogTime.get(filePath) || 0;
+                const now = Date.now();
+                if (now - lastLogTime < DIAGNOSTIC_LOG_THROTTLE_MS) {
+                    return; // Skip logging if we've logged this file recently
+                }
+                lastDiagnosticLogTime.set(filePath, now);
+                
                 // Determine change type
                 const changeType = getDiagnosticChangeType(uri, currentDiagnostics);
                 
-                // Log the diagnostic change
+                // Log the diagnostic change (now throttled)
                 logEvent('diagnostic_change', {
                     file: filePath,
                     diagnosticCount: currentDiagnostics.length,
