@@ -75,7 +75,7 @@ const ERROR_HEAVY_SESSION_THRESHOLD = 10; // 10+ errors in a file
 
 function getNotificationThrottleMs(): number {
     const config = vscode.workspace.getConfiguration('frolic');
-    const hours = config.get<number>('notificationFrequencyHours', 2);
+    const hours = config.get<number>('notificationFrequencyHours', 24);
     return hours * 60 * 60 * 1000; // Convert hours to milliseconds
 }
 
@@ -396,7 +396,7 @@ function logEvent(eventType: string, data: any) {
     resetInactivityBackupTimer();
 
     // Send digest if buffer gets large (activity-based trigger)
-    if (LOG_BUFFER.length >= 50 && LOG_BUFFER.length % 25 === 0) {
+    if (LOG_BUFFER.length >= 1000 && LOG_BUFFER.length % 500 === 0) {
         console.log(`[FROLIC] Buffer reached ${LOG_BUFFER.length} events, considering digest send`);
         // Don't block logging - send in background
         if (extensionContext) {
@@ -409,9 +409,9 @@ function logEvent(eventType: string, data: any) {
     // Debug logging (removed environment detection)
     // console.log(`[FROLIC] ${eventType}`, entry);
 
-    // Update status bar to reflect current event count
+    // Update status bar to reflect current event count in tooltip
     // Only update if status bar is already in authenticated state
-    if (statusBarItem && statusBarItem.text.includes('$(check) Frolic')) {
+    if (statusBarItem && statusBarItem.text.includes('$(check)')) {
         updateStatusBar('authenticated');
     }
 }
@@ -935,12 +935,10 @@ function stopInactivityBackupTimer(): void {
 
 function getApiBaseUrl(): string {
   const config = vscode.workspace.getConfiguration('frolic');
-      const url = config.get<string>('apiBaseUrl') || 'https://www.getfrolic.io';
+  const url = config.get<string>('apiBaseUrl') || 'https://getfrolic.dev';
   
-  // Log the URL for debugging
-  console.log('[FROLIC] getApiBaseUrl() returning:', url);
-  
-    return url;
+  // Remove debugging log
+  return url;
 }
 
 // Helper function to add timeout to fetch requests
@@ -996,35 +994,24 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   const accessToken = await context.secrets.get('frolic.accessToken');
   const refreshToken = await context.secrets.get('frolic.refreshToken');
   
-  console.log('[FROLIC] getValidAccessToken called:', {
-    hasAccessToken: !!accessToken,
-    hasRefreshToken: !!refreshToken,
-    accessTokenLength: accessToken?.length || 0
-  });
-  
   // If no access token, check if we have refresh token
   if (!accessToken) {
     if (refreshToken) {
-      console.log('[FROLIC] No access token but refresh token exists, attempting refresh');
       return await performTokenRefresh(context, refreshToken);
     }
-    console.log('[FROLIC] No access token and no refresh token available');
     return null;
   }
   
   // Check if access token is expired by trying to decode it
   if (isTokenExpired(accessToken)) {
-    console.log('[FROLIC] Access token is expired, attempting refresh');
     if (refreshToken) {
       return await performTokenRefresh(context, refreshToken);
     } else {
-      console.log('[FROLIC] No refresh token available, user needs to re-authenticate');
       await context.secrets.delete('frolic.accessToken');
       return null;
     }
   }
   
-  console.log('[FROLIC] Access token is valid, returning it');
   return accessToken;
 }
 
@@ -1032,11 +1019,10 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
  * Perform token refresh with race condition protection
  */
 async function performTokenRefresh(context: vscode.ExtensionContext, refreshToken: string): Promise<string | null> {
-  // If already refreshing, wait for the existing refresh to complete
-  if (isRefreshing && refreshPromise) {
-    console.log('[FROLIC] Token refresh already in progress, waiting...');
-    return await refreshPromise;
-  }
+      // If already refreshing, wait for the existing refresh to complete
+    if (isRefreshing && refreshPromise) {
+      return await refreshPromise;
+    }
   
   // Start new refresh
   isRefreshing = true;
@@ -1055,15 +1041,15 @@ async function performTokenRefresh(context: vscode.ExtensionContext, refreshToke
  * Clear all authentication tokens and reset auth state
  */
 async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<void> {
-  console.log('[FROLIC] Clearing all authentication tokens');
   await context.secrets.delete('frolic.accessToken');
   await context.secrets.delete('frolic.refreshToken');
+  await context.secrets.delete('frolic.codeVerifier');
+  await context.secrets.delete('frolic.state');
   
-  // Reset any ongoing refresh state
-  isRefreshing = false;
+  // Clear any existing refresh promise
   refreshPromise = null;
   
-  // 🔄 ENHANCED: Stop background token refresh when clearing tokens
+  // Stop background token refresh when clearing tokens
   stopBackgroundTokenRefresh();
 }
 
@@ -1074,7 +1060,6 @@ function isTokenExpired(token: string): boolean {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) {
-      console.log('[FROLIC] Token validation failed: Invalid JWT format (not 3 parts)');
       return true;
     }
     
@@ -1082,28 +1067,12 @@ function isTokenExpired(token: string): boolean {
     const now = Math.floor(Date.now() / 1000);
     
     if (!payload.exp) {
-      console.log('[FROLIC] Token validation: No expiration claim found, treating as valid');
       return false; // No expiration claim means token doesn't expire
     }
     
-    const timeUntilExpiry = payload.exp - now;
-    // 🔄 FIXED: Only treat as expired if actually expired, not proactively
-    const isExpired = payload.exp < now;
-    
-    console.log('[FROLIC] Token validation check:', {
-      exp: payload.exp,
-      expDate: new Date(payload.exp * 1000).toISOString(),
-      now: now,
-      nowDate: new Date(now * 1000).toISOString(),
-      timeUntilExpiry: timeUntilExpiry,
-      timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 60),
-      isExpired: isExpired
-    });
-    
     // Return true ONLY if actually expired
-    return isExpired;
+    return payload.exp < now;
   } catch (err) {
-    console.log('[FROLIC] Error checking token expiration:', err);
     return true; // Assume expired if we can't parse
   }
 }
@@ -1135,23 +1104,22 @@ function getTokenExpirationTime(token: string): string {
 function shouldProactivelyRefreshToken(token: string): boolean {
   try {
     const parts = token.split('.');
-    if (parts.length !== 3) return false;
-    
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-    if (!payload.exp) return false;
-    
-    const now = Math.floor(Date.now() / 1000);
-    const timeUntilExpiry = payload.exp - now;
-    const PROACTIVE_REFRESH_BUFFER = 10 * 60; // 10 minutes in seconds
-    
-    // Only refresh if token expires within 10 minutes but is not yet expired
-    const needsProactiveRefresh = timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER && timeUntilExpiry > 0;
-    
-    if (needsProactiveRefresh) {
-      console.log('[FROLIC] Token expires in', Math.round(timeUntilExpiry / 60), 'minutes - scheduling proactive refresh');
+    if (parts.length !== 3) {
+      return false;
     }
     
-    return needsProactiveRefresh;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const now = Math.floor(Date.now() / 1000);
+    
+    if (!payload.exp) {
+      return false; // No expiration claim means token doesn't expire
+    }
+    
+    const timeUntilExpiry = payload.exp - now;
+    const PROACTIVE_REFRESH_BUFFER = 10 * 60; // 10 minutes
+    
+    // Only refresh if token expires within 10 minutes but is not yet expired
+    return timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER && timeUntilExpiry > 0;
   } catch (err) {
     return false;
   }
@@ -1164,36 +1132,19 @@ async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): 
   try {
     const accessToken = await context.secrets.get('frolic.accessToken');
     const refreshToken = await context.secrets.get('frolic.refreshToken');
+    const shouldRefreshProactively = accessToken ? shouldProactivelyRefreshToken(accessToken) : false;
     
     if (!accessToken || !refreshToken) {
-      console.log('[FROLIC] Background refresh: No tokens available, skipping');
       return;
     }
     
-    // Check if token needs proactive refresh (within 10 minutes of expiry)
-    const shouldRefreshProactively = shouldProactivelyRefreshToken(accessToken);
-    
     if (isTokenExpired(accessToken)) {
-      console.log('[FROLIC] Background refresh: Token is expired, performing emergency refresh...');
-      const newToken = await performTokenRefresh(context, refreshToken);
-      if (newToken) {
-        console.log('[FROLIC] Background refresh: Successfully refreshed expired token');
-      } else {
-        console.log('[FROLIC] Background refresh: Failed to refresh expired token');
-      }
+      await performTokenRefresh(context, refreshToken);
     } else if (shouldRefreshProactively) {
-      console.log('[FROLIC] Background refresh: Token expires soon, performing proactive refresh...');
-      const newToken = await performTokenRefresh(context, refreshToken);
-      if (newToken) {
-        console.log('[FROLIC] Background refresh: Successfully refreshed token proactively');
-      } else {
-        console.log('[FROLIC] Background refresh: Failed proactive refresh, will retry later');
-      }
-    } else {
-      console.log('[FROLIC] Background refresh: Token still valid, no refresh needed');
+      await performTokenRefresh(context, refreshToken);
     }
   } catch (err) {
-    console.log('[FROLIC] Background refresh error:', err);
+    // Silent background refresh - don't log errors
   }
 }
 
@@ -1205,17 +1156,16 @@ function startBackgroundTokenRefresh(context: vscode.ExtensionContext): void {
     clearInterval(backgroundTokenRefreshTimer);
   }
   
-  console.log('[FROLIC] Starting background token refresh (every 30 minutes)');
   backgroundTokenRefreshTimer = setInterval(() => {
-    performBackgroundTokenRefresh(context).catch(err => {
-      console.log('[FROLIC] Background token refresh failed:', err);
+    performBackgroundTokenRefresh(context).catch(() => {
+      // Silent error handling for background operations
     });
   }, TOKEN_REFRESH_CHECK_INTERVAL);
   
   // Also perform initial check after 5 minutes
   setTimeout(() => {
-    performBackgroundTokenRefresh(context).catch(err => {
-      console.log('[FROLIC] Initial background token refresh failed:', err);
+    performBackgroundTokenRefresh(context).catch(() => {
+      // Silent error handling for background operations
     });
   }, 5 * 60 * 1000);
 }
@@ -1227,7 +1177,6 @@ function stopBackgroundTokenRefresh(): void {
   if (backgroundTokenRefreshTimer) {
     clearInterval(backgroundTokenRefreshTimer);
     backgroundTokenRefreshTimer = null;
-    console.log('[FROLIC] Stopped background token refresh');
   }
 }
 
@@ -1876,9 +1825,7 @@ function analyzeLogs(logs: any[]): any {
 
 // Removed all helper functions - analysis now done by backend
 
-export async function signInCommand(context: vscode.ExtensionContext) {
-  console.log('[FROLIC] Starting enhanced sign-in flow...');
-  
+  export async function signInCommand(context: vscode.ExtensionContext) {
   // Show loading state
   updateStatusBar('initializing');
   
@@ -1897,13 +1844,10 @@ export async function signInCommand(context: vscode.ExtensionContext) {
     await context.secrets.store('frolic.codeVerifier', codeVerifier);
     await context.secrets.store('frolic.state', state);
     
-    // Build auth URL
-    const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
-    
-    // Debug: Log the URL being used
-    console.log(`[FROLIC] Auth URL constructed: ${authUrl}`);
-    
-    // Show initial progress message
+          // Build auth URL
+      const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
+      
+      // Show initial progress message
     const progressResult = await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
       title: "Frolic Sign-In",
@@ -1957,10 +1901,10 @@ export async function signInCommand(context: vscode.ExtensionContext) {
       
       const tokenResponse = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/token`, {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'User-Agent': 'VSCode-Frolic-Extension/1.0.3'
-        },
+                  headers: { 
+            'Content-Type': 'application/json',
+            'User-Agent': 'VSCode-Frolic-Extension/1.0.21'
+          },
         body: JSON.stringify({ 
           code: code.trim(), 
           state: storedState, 
@@ -1990,104 +1934,44 @@ export async function signInCommand(context: vscode.ExtensionContext) {
         throw new Error('No access token received from server');
       }
       
-      progress.report({ message: "Saving authentication..." });
-      
-      // Store tokens securely with detailed logging
-      console.log('[FROLIC SIGNIN] About to store access token, length:', accessToken?.length);
-      await context.secrets.store('frolic.accessToken', accessToken);
-      
-      // Immediately verify access token storage
-      console.log('[FROLIC SIGNIN] Verifying access token storage...');
-      const storedAccessToken = await context.secrets.get('frolic.accessToken');
-      const accessTokenStored = storedAccessToken === accessToken;
-      console.log('[FROLIC SIGNIN] Access token verification:', {
-        stored: !!storedAccessToken,
-        matches: accessTokenStored,
-        originalLength: accessToken?.length || 0,
-        storedLength: storedAccessToken?.length || 0
-      });
-      
-      if (refreshToken) {
-        console.log('[FROLIC SIGNIN] About to store refresh token, length:', refreshToken?.length);
-        await context.secrets.store('frolic.refreshToken', refreshToken);
+              progress.report({ message: "Saving authentication..." });
         
-        // Immediately verify refresh token storage
-        console.log('[FROLIC SIGNIN] Verifying refresh token storage...');
-        const storedRefreshToken = await context.secrets.get('frolic.refreshToken');
-        const refreshTokenStored = storedRefreshToken === refreshToken;
-        console.log('[FROLIC SIGNIN] Refresh token verification:', {
-          stored: !!storedRefreshToken,
-          matches: refreshTokenStored,
-          originalLength: refreshToken?.length || 0,
-          storedLength: storedRefreshToken?.length || 0
-        });
+        // Store tokens securely
+        await context.secrets.store('frolic.accessToken', accessToken);
         
-        if (accessTokenStored && refreshTokenStored) {
-          console.log('[FROLIC SIGNIN] ✅ Both tokens stored and verified successfully');
-      } else {
-          console.error('[FROLIC SIGNIN] ❌ Token storage verification failed!', {
-            accessTokenOK: accessTokenStored,
-            refreshTokenOK: refreshTokenStored
-          });
+        if (refreshToken) {
+          await context.secrets.store('frolic.refreshToken', refreshToken);
         }
-      } else {
-        console.log('[FROLIC SIGNIN] Only access token received (no refresh token)');
-        if (!accessTokenStored) {
-          console.error('[FROLIC SIGNIN] ❌ Access token storage verification failed!');
-        }
-      }
       
       // Clean up PKCE parameters
       await context.secrets.delete('frolic.codeVerifier');
       await context.secrets.delete('frolic.state');
       
       return { accessToken, refreshToken };
-    });
-    
-    // Success! But let's verify tokens one more time
-    console.log('[FROLIC SIGNIN] Sign-in flow completed, performing final token verification...');
-    const finalAccessToken = await context.secrets.get('frolic.accessToken');
-    const finalRefreshToken = await context.secrets.get('frolic.refreshToken');
-    
-    console.log('[FROLIC SIGNIN] Final verification results:', {
-      accessToken: {
-        exists: !!finalAccessToken,
-        length: finalAccessToken?.length || 0,
-        preview: finalAccessToken ? finalAccessToken.substring(0, 20) + '...' : 'null'
-      },
-      refreshToken: {
-        exists: !!finalRefreshToken,
-        length: finalRefreshToken?.length || 0,
-        preview: finalRefreshToken ? finalRefreshToken.substring(0, 20) + '...' : 'null'
+          });
+      
+      // Verify tokens were stored successfully
+      const finalAccessToken = await context.secrets.get('frolic.accessToken');
+      
+      if (!finalAccessToken) {
+        console.error('[FROLIC] Critical: Access token missing after sign-in');
+        vscode.window.showErrorMessage('Authentication failed: Tokens were not saved properly. Please try again.');
+        updateStatusBar('unauthenticated');
+        return;
       }
-    });
-    
-    if (!finalAccessToken) {
-      console.error('[FROLIC SIGNIN] 🚨 CRITICAL: Access token is missing after sign-in!');
-      vscode.window.showErrorMessage('🚨 Critical: Tokens were not saved! Please check Extension Host logs.');
-      updateStatusBar('unauthenticated');
-      return;
-    }
     
     updateStatusBar('authenticated');
     
-    // 🔄 ENHANCED: Start background token refresh after successful sign-in
+    // Start background token refresh after successful sign-in
     startBackgroundTokenRefresh(context);
     
-    // Show success message with next steps
-    const action = await vscode.window.showInformationMessage(
-      '🎉 Successfully signed in to Frolic! Your coding activity will now be tracked for personalized recaps.',
-      'Send Test Digest',
-      'View Activity'
-    );
+    // Show success message
+    vscode.window.showInformationMessage('✅ Frolic: Successfully signed in! Your coding activity will now be tracked.');
     
-    if (action === 'Send Test Digest') {
-      vscode.commands.executeCommand('frolic.sendDigest');
-    } else if (action === 'View Activity') {
-      vscode.commands.executeCommand('frolic-activity.focus');
+    // Refresh activity panel to show updated auth status
+    if (activityProvider) {
+      activityProvider.refresh();
     }
-    
-    console.log('[FROLIC] Sign-in completed successfully');
     
   } catch (error: any) {
     console.error('[FROLIC] Sign-in error:', error);
@@ -2354,7 +2238,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (selection === 'Sign In to Get Started') {
                 vscode.commands.executeCommand('frolic.signIn');
             } else if (selection === 'Learn More') {
-                vscode.env.openExternal(vscode.Uri.parse('https://getfrolic.io'));
+                                 vscode.env.openExternal(vscode.Uri.parse('https://getfrolic.dev'));
             }
         }
     });
@@ -2732,7 +2616,7 @@ function startPeriodicDigestSending(context: vscode.ExtensionContext) {
     }
     
     const config = vscode.workspace.getConfiguration('frolic');
-    const frequencyHours = config.get<number>('digestFrequencyHours', 24);
+    const frequencyHours = config.get<number>('digestFrequencyHours', 0.75);
     const intervalMs = frequencyHours * 60 * 60 * 1000; // Convert hours to milliseconds
     
     // Send initial digest if there's already data in buffer (from previous session)
@@ -2776,6 +2660,12 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 LOG_BUFFER.length = 0;
                 bufferMemoryUsage = 0; // Reset memory tracking
                 sessionId = crypto.randomUUID();
+                
+                // Reset session timer in activity panel
+                if (activityProvider) {
+                    activityProvider.resetSessionTimer();
+                }
+                
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
                 updateStatusBar('authenticated');
                 
@@ -2796,9 +2686,6 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                     vscode.window.showInformationMessage(message);
                     lastNotificationTime = Date.now();
                     digestsSentSinceLastNotification = 0; // Reset counter
-                } else {
-                    // Still log to console for debugging, but no popup
-                    console.log(`[FROLIC] 🔇 Digest sent silently (${eventCount} events, ${digestsSentSinceLastNotification} total since last notification)`);
                 }
                 
                 return eventCount; // Return the number of events processed
@@ -2809,12 +2696,10 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 // Handle different error types
                 if (err.message === 'NO_AUTH_TOKEN' || err.message === 'AUTH_TOKEN_EXPIRED') {
                     // Auth errors - don't retry, update status
-                    console.log(`[FROLIC] Authentication error: ${err.message}. Buffer not cleared (${eventCount} events preserved).`);
                     updateStatusBar('unauthenticated');
                     return 0; // Exit without clearing buffer
                 } else if (err.message === 'ACCESS_FORBIDDEN' || err.message === 'CLIENT_ERROR') {
                     // Client errors - don't retry
-                    console.log(`[FROLIC] Client error: ${err.message}. Buffer not cleared (${eventCount} events preserved).`);
                     updateStatusBar('error');
                     return 0; // Exit without clearing buffer
                 }
@@ -2822,7 +2707,6 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 // For network/server errors, retry with exponential backoff
                 if (attempt < maxRetries) {
                     const delay = Math.min(1000 * Math.pow(2, attempt), 10000); // Cap at 10 seconds
-                    console.log(`[FROLIC] Retrying in ${delay}ms...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
             }
@@ -2859,14 +2743,14 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             statusBarItem.command = undefined;
             break;
         case 'authenticated':
-            statusBarItem.text = `$(check) Frolic (${LOG_BUFFER.length})`;
-            statusBarItem.tooltip = `Frolic: ${LOG_BUFFER.length} events logged. Click to flush.`;
+            statusBarItem.text = '$(check) Frolic Connected';
+            statusBarItem.tooltip = `Frolic: Connected and tracking activity (${LOG_BUFFER.length} events logged). Click to sign out.`;
             statusBarItem.backgroundColor = undefined;
-            statusBarItem.command = 'frolic.flushLogs';
+            statusBarItem.command = 'frolic.signOut';
             break;
         case 'unauthenticated':
-            statusBarItem.text = '$(sign-in) Sign in to Frolic';
-            statusBarItem.tooltip = 'Frolic: Click to sign in';
+            statusBarItem.text = '$(sign-in) Connect Frolic';
+            statusBarItem.tooltip = 'Frolic: Click to connect and enable personalized coding insights';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
             statusBarItem.command = 'frolic.signIn';
             break;
@@ -2900,16 +2784,21 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         this._onDidChangeTreeData.fire();
     }
 
+    resetSessionTimer(): void {
+        this.sessionStartTime = new Date();
+        this.refresh(); // Update the display
+    }
+
     getTreeItem(element: FrolicTreeItem): vscode.TreeItem {
         return element;
     }
 
-    getChildren(element?: FrolicTreeItem): Thenable<FrolicTreeItem[]> {
+    async getChildren(element?: FrolicTreeItem): Promise<FrolicTreeItem[]> {
         if (!element) {
-            // Root level items with enhanced metrics
+            // Streamlined root level items - show essentials only
             const items: FrolicTreeItem[] = [];
             
-            // Enhanced session header with logo
+            // Session header with logo
             const logoPath = vscode.Uri.file(path.join(this.context.extensionPath, 'images', 'frolic_logo.png'));
             const sessionDuration = Math.round((Date.now() - this.sessionStartTime.getTime()) / 1000 / 60);
             items.push(new FrolicTreeItem(
@@ -2920,129 +2809,167 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
                 logoPath
             ));
 
-            // Authentication status section (NEW)
+            // Auth status (always visible) - get actual status
+            const authItems = await this.getAuthStatusItems();
+            if (authItems.length > 0) {
+                items.push(authItems[0]); // Use the actual auth status item
+            }
+
+            // Last digest status (always visible)
             items.push(new FrolicTreeItem(
-                '🔐 Account Status',
-                vscode.TreeItemCollapsibleState.Expanded,
-                'auth-status'
+                '📧 Last digest: just now',
+                vscode.TreeItemCollapsibleState.None,
+                'digest-status',
+                undefined,
+                new vscode.ThemeIcon('mail')
             ));
 
-            // Live stats section
+            // Send digest action (always visible)
+            const digestReady = LOG_BUFFER.length >= 1000;
             items.push(new FrolicTreeItem(
-                '⚡ Live Stats',
-                vscode.TreeItemCollapsibleState.Expanded,
-                'live-stats'
+                digestReady ? '📤 Send Digest (Ready!)' : `📤 Send Digest (${LOG_BUFFER.length}/1000)`,
+                vscode.TreeItemCollapsibleState.None,
+                'action-send-digest',
+                {
+                    command: 'frolic.sendDigest',
+                    title: 'Send Digest Now'
+                },
+                new vscode.ThemeIcon(digestReady ? 'cloud-upload' : 'clock')
             ));
 
-            // Session overview
+            // Recent activity summary (always visible)
+            const recentActivity = this.getRecentActivity();
             items.push(new FrolicTreeItem(
-                '📊 Session Overview',
-                vscode.TreeItemCollapsibleState.Expanded,
-                'session-overview'
+                `🔥 Recent: ${recentActivity} edits/5m`,
+                vscode.TreeItemCollapsibleState.None,
+                'activity-summary',
+                undefined,
+                new vscode.ThemeIcon('flame')
             ));
 
-            // Active files
+            // Details section (collapsed by default - contains all the detailed metrics)
+            items.push(new FrolicTreeItem(
+                '📊 Details',
+                vscode.TreeItemCollapsibleState.Collapsed,
+                'details-section'
+            ));
+
+            return items;
+        } 
+        
+        else if (element.contextValue === 'details-section') {
+            // All the detailed information goes here
+            const items: FrolicTreeItem[] = [];
+            
+            // Session overview stats
+            const totalEvents = LOG_BUFFER.length;
+            const filesEdited = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
+            const totalLines = this.getTotalLinesChanged();
+            const aiInsertions = this.getAIInsertions();
+            const codingVelocity = this.getCodingVelocity();
+            const bufferMemoryMB = (bufferMemoryUsage / 1024 / 1024).toFixed(1);
+            
+            items.push(new FrolicTreeItem(
+                `📝 Events: ${totalEvents}`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('symbol-event')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                `📁 Files: ${filesEdited}`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('file')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                `📏 Lines: +${totalLines}`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('add')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                `🤖 AI Assists: ${aiInsertions}`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('robot')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                `⚡ Velocity: ${codingVelocity}/min`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('pulse')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                `💾 Buffer: ${bufferMemoryMB}MB`,
+                vscode.TreeItemCollapsibleState.None,
+                'detail-stat',
+                undefined,
+                new vscode.ThemeIcon('database')
+            ));
+
+            // Add active files if any
             const activeFiles = this.getActiveFiles();
             if (activeFiles.length > 0) {
                 items.push(new FrolicTreeItem(
                     `📁 Top Files (${activeFiles.length})`,
-                    vscode.TreeItemCollapsibleState.Expanded,
+                    vscode.TreeItemCollapsibleState.Collapsed,
                     'active-files'
                 ));
             }
 
-            // Insights
+            // Add insights
+            const insights = this.generateInsights();
+            if (insights.length > 0) {
+                items.push(new FrolicTreeItem(
+                    `💡 Insights (${insights.length})`,
+                    vscode.TreeItemCollapsibleState.Collapsed,
+                    'insights'
+                ));
+            }
+
+            // Add additional actions
             items.push(new FrolicTreeItem(
-                '💡 Insights',
-                vscode.TreeItemCollapsibleState.Expanded,
-                'insights'
+                '📝 Write Logs to File',
+                vscode.TreeItemCollapsibleState.None,
+                'action-write-logs',
+                {
+                    command: 'frolic.writeLogsToFile',
+                    title: 'Write Logs'
+                },
+                new vscode.ThemeIcon('save')
+            ));
+            
+            items.push(new FrolicTreeItem(
+                '🔄 Refresh Panel',
+                vscode.TreeItemCollapsibleState.None,
+                'action-refresh',
+                {
+                    command: 'frolic.refreshActivityPanel',
+                    title: 'Refresh Panel'
+                },
+                new vscode.ThemeIcon('refresh')
             ));
 
-            // Quick actions
-            items.push(new FrolicTreeItem(
-                '🚀 Quick Actions',
-                vscode.TreeItemCollapsibleState.Expanded,
-                'actions'
-            ));
-
-            return Promise.resolve(items);
-        } 
+            return items;
+        }
         
         else if (element.contextValue === 'auth-status') {
             return this.getAuthStatusItems();
         }
         
-        else if (element.contextValue === 'live-stats') {
-            const recentActivity = this.getRecentActivity();
-            const codingVelocity = this.getCodingVelocity();
-            const bufferMemoryMB = (bufferMemoryUsage / 1024 / 1024).toFixed(1);
-            
-            return Promise.resolve([
-                new FrolicTreeItem(
-                    `🔥 Recent: ${recentActivity} edits/5m`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'live-stat',
-                    undefined,
-                    new vscode.ThemeIcon('flame')
-                ),
-                new FrolicTreeItem(
-                    `⚡ Velocity: ${codingVelocity}/min`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'live-stat',
-                    undefined,
-                    new vscode.ThemeIcon('pulse')
-                ),
-                new FrolicTreeItem(
-                    `💾 Buffer: ${bufferMemoryMB}MB`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'live-stat',
-                    undefined,
-                    new vscode.ThemeIcon('database')
-                )
-            ]);
-        }
-        
-        else if (element.contextValue === 'session-overview') {
-            const totalEvents = LOG_BUFFER.length;
-            const filesEdited = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
-            const totalLines = this.getTotalLinesChanged();
-            const aiInsertions = this.getAIInsertions();
-
-            return Promise.resolve([
-                new FrolicTreeItem(
-                    `📝 Events: ${totalEvents}`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'overview-stat',
-                    undefined,
-                    new vscode.ThemeIcon('symbol-event')
-                ),
-                new FrolicTreeItem(
-                    `📁 Files: ${filesEdited}`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'overview-stat',
-                    undefined,
-                    new vscode.ThemeIcon('file')
-                ),
-                new FrolicTreeItem(
-                    `📏 Lines: +${totalLines}`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'overview-stat',
-                    undefined,
-                    new vscode.ThemeIcon('add')
-                ),
-                new FrolicTreeItem(
-                    `🤖 AI Assists: ${aiInsertions}`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'overview-stat',
-                    undefined,
-                    new vscode.ThemeIcon('robot')
-                )
-            ]);
-        }
-        
         else if (element.contextValue === 'active-files') {
             const activeFiles = this.getActiveFiles();
-            return Promise.resolve(activeFiles.map(file => {
+            return activeFiles.map(file => {
                 const fileIcon = this.getFileIcon(file.fullPath);
                 return new FrolicTreeItem(
                     `${fileIcon} ${file.name} (${file.count})`,
@@ -3054,12 +2981,12 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
                         arguments: [vscode.Uri.file(path.resolve(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', file.fullPath))]
                     }
                 );
-            }));
+            });
         }
         
         else if (element.contextValue === 'insights') {
             const insights = this.generateInsights();
-            return Promise.resolve(insights.map(insight => 
+            return insights.map(insight => 
                 new FrolicTreeItem(
                     insight,
                     vscode.TreeItemCollapsibleState.None,
@@ -3067,46 +2994,10 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
                     undefined,
                     new vscode.ThemeIcon('lightbulb')
                 )
-            ));
-        }
-        
-        else if (element.contextValue === 'actions') {
-            const digestReady = LOG_BUFFER.length >= 10;
-            return Promise.resolve([
-                new FrolicTreeItem(
-                    digestReady ? '📤 Send Digest (Ready!)' : `📤 Send Digest (${LOG_BUFFER.length}/10)`,
-                    vscode.TreeItemCollapsibleState.None,
-                    'action-send-digest',
-                    {
-                        command: 'frolic.sendDigest',
-                        title: 'Send Digest Now'
-                    },
-                    new vscode.ThemeIcon(digestReady ? 'cloud-upload' : 'clock')
-                ),
-                new FrolicTreeItem(
-                    '📝 Write Logs to File',
-                    vscode.TreeItemCollapsibleState.None,
-                    'action-write-logs',
-                    {
-                        command: 'frolic.writeLogsToFile',
-                        title: 'Write Logs'
-                    },
-                    new vscode.ThemeIcon('save')
-                ),
-                new FrolicTreeItem(
-                    '🔄 Refresh Panel',
-                    vscode.TreeItemCollapsibleState.None,
-                    'action-refresh',
-                    {
-                        command: 'frolic.refreshActivityPanel',
-                        title: 'Refresh Panel'
-                    },
-                    new vscode.ThemeIcon('refresh')
-                )
-            ]);
+            );
         }
 
-        return Promise.resolve([]);
+        return [];
     }
 
     private getActiveFiles(): {name: string, fullPath: string, count: number}[] {
@@ -3236,7 +3127,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
     private async getAuthStatusItems(): Promise<FrolicTreeItem[]> {
         const accessToken = await getValidAccessToken(this.context);
         const status = accessToken ? 'authenticated' : 'unauthenticated';
-        const label = status === 'authenticated' ? `✅ Signed in` : '❌ Not signed in';
+        const label = status === 'authenticated' ? `🚪Sign Out` : '⚠️Sign In';
         
         return [
             new FrolicTreeItem(

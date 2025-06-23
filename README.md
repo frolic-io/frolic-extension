@@ -80,8 +80,8 @@ Unlock additional features:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `frolic.enableLogging` | Enable/disable activity logging | `true` |
-| `frolic.apiBaseUrl` | API endpoint for Frolic services | `https://getfrolic.io` |
-| `frolic.digestFrequencyHours` | How often to send activity digests | `24` hours |
+| `frolic.apiBaseUrl` | API endpoint for Frolic services | `https://getfrolic.dev` |
+| `frolic.digestFrequencyHours` | How often to send activity digests | `0.75` hours (45 minutes) |
 | `frolic.maxBufferSize` | Maximum events to keep in memory | `10000` |
 | `frolic.maxMemoryMB` | Memory limit for activity buffer | `50` MB |
 | `frolic.tokenExpiration` | Authentication token preference | `long` |
@@ -169,4 +169,4 @@ For complete details, see our [Privacy Policy](./PRIVACY.md).
 
 ---
 
-**Questions?** Visit [getfrolic.io](https://getfrolic.io) or open an issue on [GitHub](https://github.com/frolic-io/frolic-extension).
+**Questions?** Visit [getfrolic.dev](https://getfrolic.dev) or open an issue on [GitHub](https://github.com/frolic-io/frolic-extension).

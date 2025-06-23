@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.17",
+  "version": "1.0.23",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {
@@ -94,15 +94,15 @@
         },
         "frolic.apiBaseUrl": {
           "type": "string",
-          "default": "https://getfrolic.io",
+          "default": "https://getfrolic.dev",
           "description": "Base URL for Frolic API endpoints."
         },
         "frolic.digestFrequencyHours": {
           "type": "number",
-          "default": 24,
-          "minimum": 1,
+          "default": 0.75,
+          "minimum": 0.25,
           "maximum": 168,
-          "description": "How often to send coding activity digests to Frolic (in hours). Default is 24 hours (daily)."
+          "description": "How often to send coding activity digests to Frolic (in hours). Default is 0.75 hours (45 minutes)."
         },
         "frolic.maxBufferSize": {
           "type": "number",
