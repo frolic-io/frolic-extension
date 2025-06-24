@@ -37,7 +37,7 @@ let digestsSentSinceLastNotification = 0;
 
 // 🔄 ENHANCED: Background token refresh management
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
-const TOKEN_REFRESH_CHECK_INTERVAL = 30 * 60 * 1000; // Check every 30 minutes
+const TOKEN_REFRESH_CHECK_INTERVAL = 5 * 60 * 1000; // Check every 5 minutes for more aggressive refresh
 
 // 🔄 PHASE 2.2: Learning Struggle Detection - Global state
 let userActionHistory: Array<{
@@ -1034,6 +1034,58 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
 }
 
 /**
+ * Check if we have network connectivity
+ */
+async function checkNetworkConnectivity(): Promise<boolean> {
+  try {
+    // Try to reach a reliable endpoint with a short timeout
+    const response = await fetchWithTimeout('https://www.google.com/generate_204', {
+      method: 'HEAD'
+    }, 5000);
+    return response.ok || response.status === 204;
+  } catch {
+    // If Google fails, try GitHub as backup
+    try {
+      const response = await fetchWithTimeout('https://api.github.com', {
+        method: 'HEAD'
+      }, 5000);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * Helper function to retry an operation with exponential backoff
+ */
+async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxRetries: number = 3,
+  initialDelay: number = 2000
+): Promise<T | null> {
+  let lastError: any;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      
+      // Don't retry on the last attempt
+      if (attempt < maxRetries - 1) {
+        const delay = initialDelay * Math.pow(2, attempt);
+        console.log(`[FROLIC] Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  console.log(`[FROLIC] All ${maxRetries} retry attempts failed:`, lastError?.message);
+  return null;
+}
+
+/**
  * Perform token refresh with race condition protection
  */
 async function performTokenRefresh(context: vscode.ExtensionContext, refreshToken: string): Promise<string | null> {
@@ -1042,12 +1094,35 @@ async function performTokenRefresh(context: vscode.ExtensionContext, refreshToke
       return await refreshPromise;
     }
   
-  // Start new refresh
+  // Start new refresh with retry logic
   isRefreshing = true;
-  refreshPromise = refreshAccessToken(context, refreshToken);
+  refreshPromise = retryWithBackoff(
+    () => refreshAccessToken(context, refreshToken),
+    3, // max retries
+    2000 // initial delay
+  );
   
   try {
     const result = await refreshPromise;
+    
+    // If all retries failed, check network before clearing tokens
+    if (!result) {
+      const hasNetwork = await checkNetworkConnectivity();
+      
+      if (!hasNetwork) {
+        console.log('[FROLIC] Token refresh failed but no network connectivity detected - keeping tokens');
+        // Don't clear tokens if we're offline
+      } else {
+        const accessToken = await context.secrets.get('frolic.accessToken');
+        if (accessToken) {
+          console.log('[FROLIC] Token refresh failed after retries with network available, clearing all tokens');
+          await context.secrets.delete('frolic.accessToken');
+          await context.secrets.delete('frolic.refreshToken');
+          updateStatusBar('unauthenticated');
+        }
+      }
+    }
+    
     return result;
   } finally {
     isRefreshing = false;
@@ -1117,7 +1192,7 @@ function getTokenExpirationTime(token: string): string {
 }
 
 /**
- * Check if token should be proactively refreshed (within 10 minutes of expiry)
+ * Check if token should be proactively refreshed (when 50% of lifetime remains)
  */
 function shouldProactivelyRefreshToken(token: string): boolean {
   try {
@@ -1133,11 +1208,18 @@ function shouldProactivelyRefreshToken(token: string): boolean {
       return false; // No expiration claim means token doesn't expire
     }
     
+    // Get issued at time (iat) to calculate total lifetime
+    const issuedAt = payload.iat || now;
+    const totalLifetime = payload.exp - issuedAt;
+    const timeElapsed = now - issuedAt;
     const timeUntilExpiry = payload.exp - now;
-    const PROACTIVE_REFRESH_BUFFER = 10 * 60; // 10 minutes
     
-    // Only refresh if token expires within 10 minutes but is not yet expired
-    return timeUntilExpiry <= PROACTIVE_REFRESH_BUFFER && timeUntilExpiry > 0;
+    // Refresh when 50% of token lifetime has passed, or within 10 minutes of expiry (whichever is more aggressive)
+    const halfLifetimePassed = timeElapsed >= (totalLifetime / 2);
+    const withinTenMinutes = timeUntilExpiry <= 600;
+    
+    // Only refresh if token is not yet expired
+    return (halfLifetimePassed || withinTenMinutes) && timeUntilExpiry > 0;
   } catch (err) {
     return false;
   }
@@ -1157,12 +1239,15 @@ async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): 
     }
     
     if (isTokenExpired(accessToken)) {
+      console.log('[FROLIC] Background refresh: token expired, refreshing...');
       await performTokenRefresh(context, refreshToken);
     } else if (shouldRefreshProactively) {
+      console.log('[FROLIC] Background refresh: proactive refresh triggered');
       await performTokenRefresh(context, refreshToken);
     }
-  } catch (err) {
-    // Silent background refresh - don't log errors
+  } catch (err: any) {
+    // Log errors but don't show to user
+    console.error('[FROLIC] Background token refresh error:', err.message);
   }
 }
 
@@ -1211,7 +1296,7 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+        'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
       },
       body: JSON.stringify({ refresh_token: refreshToken })
     }, 15000); // 15 second timeout for refresh
@@ -1221,11 +1306,8 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
       console.log(`[FROLIC] Token refresh failed: ${response.status} ${errorText}`);
       
       if (response.status === 401 || response.status === 403) {
-        // Refresh token is also expired or invalid
-        console.log('[FROLIC] Refresh token expired, clearing all tokens');
-        await context.secrets.delete('frolic.accessToken');
-        await context.secrets.delete('frolic.refreshToken');
-        updateStatusBar('unauthenticated');
+        // Don't immediately clear tokens - let retry logic handle it
+        throw new Error(`Auth failed: ${response.status} ${errorText}`);
       }
       return null;
     }
@@ -1921,7 +2003,7 @@ function analyzeLogs(logs: any[]): any {
         method: 'POST',
                   headers: { 
             'Content-Type': 'application/json',
-            'User-Agent': 'VSCode-Frolic-Extension/1.0.21'
+            'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
           },
         body: JSON.stringify({ 
           code: code.trim(), 
@@ -1984,7 +2066,7 @@ function analyzeLogs(logs: any[]): any {
     startBackgroundTokenRefresh(context);
     
     // Show success message
-    vscode.window.showInformationMessage('✅ Frolic: Successfully signed in! Your coding activity will now be tracked.');
+    vscode.window.showInformationMessage('✅ Frolic: Successfully signed in!');
     
     // Refresh activity panel to show updated auth status
     if (activityProvider) {
@@ -2527,7 +2609,31 @@ export async function activate(context: vscode.ExtensionContext) {
     const hasTokens = await context.secrets.get('frolic.accessToken') && await context.secrets.get('frolic.refreshToken');
     if (hasTokens) {
         startBackgroundTokenRefresh(context);
+        
+        // Proactively refresh token on activation to ensure fresh session
+        const accessToken = await context.secrets.get('frolic.accessToken');
+        if (accessToken && shouldProactivelyRefreshToken(accessToken)) {
+            console.log('[FROLIC] Proactively refreshing token on activation');
+            performBackgroundTokenRefresh(context).catch(err => {
+                console.error('[FROLIC] Activation token refresh error:', err.message);
+            });
+        }
     }
+    
+    // Add window focus listener to refresh token when VS Code regains focus
+    context.subscriptions.push(
+        vscode.window.onDidChangeWindowState(async (state) => {
+            if (state.focused && hasTokens) {
+                const accessToken = await context.secrets.get('frolic.accessToken');
+                if (accessToken && shouldProactivelyRefreshToken(accessToken)) {
+                    console.log('[FROLIC] Window focused - checking token freshness');
+                    performBackgroundTokenRefresh(context).catch(err => {
+                        console.error('[FROLIC] Window focus token refresh error:', err.message);
+                    });
+                }
+            }
+        })
+    );
 
     console.log(`✅ Frolic Logger is now active! (${LOG_BUFFER.length} events in buffer)`);
 }
@@ -3026,7 +3132,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         return [];
     }
 
-    private getActiveFiles(): {name: string, fullPath: string, count: number}[] {
+    private getActiveFiles(): {name: string, fullPath: string, count: number}[] { 
         const fileActivity: {[key: string]: number} = {};
         
         LOG_BUFFER.forEach(entry => {
@@ -3217,7 +3323,7 @@ export async function sendDigestToBackend(
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+        'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
       },
       body: JSON.stringify({ sessionId, digest })
     }, 30000); // 30 second timeout
@@ -3251,7 +3357,7 @@ export async function sendDigestToBackend(
             headers: {
               'Authorization': `Bearer ${newToken}`,
               'Content-Type': 'application/json',
-              'User-Agent': 'VSCode-Frolic-Extension/1.0.0'
+              'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
             },
             body: JSON.stringify({ sessionId, digest })
           }, 30000);

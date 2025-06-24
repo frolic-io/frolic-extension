@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "deploy": "./scripts/deploy.sh",
     "deploy:vscode": "vsce publish",
     "deploy:openvsx": "ovsx publish",
-    "deploy:cursor": "vsce package --out frolic-cursor.vsix"
+    "deploy:cursor": "vsce package --out frolic-1.0.26-cursor.vsix"
   },
   "keywords": [
     "frolic",
