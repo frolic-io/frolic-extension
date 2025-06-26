@@ -106,6 +106,9 @@ Thumbs.db
 # Frolic specific files
 .frolic-log.json 
 
+# Documentation (contains internal design docs)
+docs/
+
 # Deployment scripts (may contain sensitive tokens/info)
 scripts/deploy.sh
 

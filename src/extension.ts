@@ -17,6 +17,10 @@ let statusBarItem: vscode.StatusBarItem;
 let activityProvider: FrolicActivityProvider | undefined;
 let extensionContext: vscode.ExtensionContext | undefined;
 
+// Offline digest queue for graceful degradation
+let offlineDigestQueue: Array<{sessionId: string, digest: any, timestamp: number}> = [];
+const MAX_OFFLINE_DIGESTS = 1000;
+
 // 🔄 PHASE 1.3: Smart Backup Triggers - Global state
 let periodicBackupTimer: NodeJS.Timeout | null = null;
 let inactivityBackupTimer: NodeJS.Timeout | null = null;
@@ -38,6 +42,7 @@ let digestsSentSinceLastNotification = 0;
 // 🔄 ENHANCED: Background token refresh management
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
 const TOKEN_REFRESH_CHECK_INTERVAL = 5 * 60 * 1000; // Check every 5 minutes for more aggressive refresh
+
 
 // 🔄 PHASE 2.2: Learning Struggle Detection - Global state
 let userActionHistory: Array<{
@@ -1086,48 +1091,131 @@ async function retryWithBackoff<T>(
 }
 
 /**
+ * Queue a digest for offline processing when network/auth issues occur
+ */
+function queueDigestForOfflineProcessing(sessionId: string, digest: any): void {
+  const queueEntry = {
+    sessionId,
+    digest,
+    timestamp: Date.now()
+  };
+  
+  // Add to queue
+  offlineDigestQueue.push(queueEntry);
+  
+  // Limit queue size to prevent memory issues
+  if (offlineDigestQueue.length > MAX_OFFLINE_DIGESTS) {
+    offlineDigestQueue.shift(); // Remove oldest entry
+  }
+  
+  console.log(`[FROLIC] Queued digest for offline processing (queue size: ${offlineDigestQueue.length})`);
+}
+
+/**
+ * Process offline digest queue when authentication is restored
+ */
+async function processOfflineDigestQueue(context: vscode.ExtensionContext): Promise<void> {
+  if (offlineDigestQueue.length === 0) {
+    return;
+  }
+  
+  console.log(`[FROLIC] Processing offline digest queue (${offlineDigestQueue.length} items)`);
+  
+  let processed = 0;
+  const startTime = Date.now();
+  
+  // Process queue while we have items and valid authentication
+  while (offlineDigestQueue.length > 0) {
+    const isAuthenticated = await getValidAccessToken(context);
+    if (!isAuthenticated) {
+      console.log('[FROLIC] Lost authentication during offline queue processing');
+      break;
+    }
+    
+    const queueEntry = offlineDigestQueue.shift()!;
+    
+    try {
+      // Try to send the queued digest
+      await sendDigestToBackend(queueEntry.sessionId, queueEntry.digest, context);
+      processed++;
+      
+      // Small delay to avoid overwhelming the server
+      if (offlineDigestQueue.length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+    } catch (error: any) {
+      // If we get auth errors, re-queue and stop processing
+      if (error.message === 'AUTH_TOKEN_EXPIRED' || error.message === 'NO_AUTH_TOKEN') {
+        offlineDigestQueue.unshift(queueEntry); // Put it back at the front
+        console.log('[FROLIC] Auth error during offline queue processing, stopping');
+        break;
+      }
+      
+      // For other errors, skip this item and continue
+      console.log(`[FROLIC] Skipping failed offline digest: ${error.message}`);
+    }
+  }
+  
+  const duration = Date.now() - startTime;
+  console.log(`[FROLIC] Offline queue processing complete: ${processed} processed in ${duration}ms`);
+  
+  // Update status bar if queue is now empty
+  if (offlineDigestQueue.length === 0) {
+    vscode.window.setStatusBarMessage('$(cloud) Frolic: All offline data synced', 5000);
+  }
+}
+
+/**
  * Perform token refresh with race condition protection
  */
 async function performTokenRefresh(context: vscode.ExtensionContext, refreshToken: string): Promise<string | null> {
-      // If already refreshing, wait for the existing refresh to complete
-    if (isRefreshing && refreshPromise) {
-      return await refreshPromise;
-    }
+  // If already refreshing, wait for the existing refresh to complete
+  if (isRefreshing && refreshPromise) {
+    console.log('[FROLIC] Token refresh already in progress, waiting for completion');
+    return await refreshPromise;
+  }
   
   // Start new refresh with retry logic
+  console.log('[FROLIC] Starting new token refresh');
   isRefreshing = true;
-  refreshPromise = retryWithBackoff(
-    () => refreshAccessToken(context, refreshToken),
-    3, // max retries
-    2000 // initial delay
-  );
   
-  try {
-    const result = await refreshPromise;
-    
-    // If all retries failed, check network before clearing tokens
-    if (!result) {
-      const hasNetwork = await checkNetworkConnectivity();
+  // Create the refresh promise with improved error handling
+  refreshPromise = (async (): Promise<string | null> => {
+    try {
+      const result = await retryWithBackoff(
+        () => refreshAccessToken(context, refreshToken),
+        3, // max retries
+        2000 // initial delay
+      );
       
-      if (!hasNetwork) {
-        console.log('[FROLIC] Token refresh failed but no network connectivity detected - keeping tokens');
-        // Don't clear tokens if we're offline
-      } else {
-        const accessToken = await context.secrets.get('frolic.accessToken');
-        if (accessToken) {
-          console.log('[FROLIC] Token refresh failed after retries with network available, clearing all tokens');
-          await context.secrets.delete('frolic.accessToken');
-          await context.secrets.delete('frolic.refreshToken');
-          updateStatusBar('unauthenticated');
+      // If all retries failed, check network before clearing tokens
+      if (!result) {
+        const hasNetwork = await checkNetworkConnectivity();
+        
+        if (!hasNetwork) {
+          console.log('[FROLIC] Token refresh failed but no network connectivity detected - keeping tokens');
+          // Don't clear tokens if we're offline
+        } else {
+          const accessToken = await context.secrets.get('frolic.accessToken');
+          if (accessToken) {
+            console.log('[FROLIC] Token refresh failed after retries with network available, clearing all tokens');
+            await context.secrets.delete('frolic.accessToken');
+            await context.secrets.delete('frolic.refreshToken');
+            updateStatusBar('unauthenticated');
+          }
         }
       }
+      
+      return result;
+    } finally {
+      // Clear refresh state only after the entire operation is complete
+      isRefreshing = false;
+      refreshPromise = null;
     }
-    
-    return result;
-  } finally {
-    isRefreshing = false;
-    refreshPromise = null;
-  }
+  })();
+  
+  return await refreshPromise;
 }
 
 /**
@@ -1283,6 +1371,7 @@ function stopBackgroundTokenRefresh(): void {
   }
 }
 
+
 /**
  * Refresh the access token using the refresh token
  */
@@ -1296,7 +1385,7 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
+        'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
       },
       body: JSON.stringify({ refresh_token: refreshToken })
     }, 15000); // 15 second timeout for refresh
@@ -1350,6 +1439,14 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
     
     // 🔄 ENHANCED: Start background token refresh after successful refresh
     startBackgroundTokenRefresh(context);
+    
+    // Process any queued offline digests after successful authentication
+    if (offlineDigestQueue.length > 0) {
+      console.log('[FROLIC] Processing queued offline digests after token refresh');
+      processOfflineDigestQueue(context).catch(error => {
+        console.log('[FROLIC] Error processing offline queue:', error.message);
+      });
+    }
     
     return newAccessToken;
     
@@ -2003,7 +2100,7 @@ function analyzeLogs(logs: any[]): any {
         method: 'POST',
                   headers: { 
             'Content-Type': 'application/json',
-            'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
+            'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
           },
         body: JSON.stringify({ 
           code: code.trim(), 
@@ -3323,17 +3420,28 @@ export async function sendDigestToBackend(
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
+        'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
       },
       body: JSON.stringify({ sessionId, digest })
     }, 30000); // 30 second timeout
+
+    if (res.ok) {
+      // Successfully sent digest - try to process any queued offline digests
+      if (offlineDigestQueue.length > 0) {
+        console.log('[FROLIC] Digest sent successfully, processing offline queue');
+        processOfflineDigestQueue(context).catch(error => {
+          console.log('[FROLIC] Error processing offline queue:', error.message);
+        });
+      }
+      return await res.json();
+    }
 
     if (!res.ok) {
       const errorText = await res.text();
       
       // Handle specific HTTP status codes
       if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
-        // Backend rejected token - but let's debug WHY before deleting it
+        // Backend rejected token - implement smart retry logic before clearing
         console.log('[FROLIC] Backend rejected token with 401/403:', {
           status: res.status,
           error: errorText,
@@ -3342,50 +3450,77 @@ export async function sendDigestToBackend(
           isLocallyExpired: isTokenExpired(accessToken)
         });
         
-        // Always clear the token when backend returns 401 - it's either expired or invalid
-        console.log('[FROLIC] Backend returned 401 - clearing stored token to force refresh');
-        await context.secrets.delete('frolic.accessToken');
+        // Implement retry logic with exponential backoff before clearing tokens
+        const MAX_RETRY_ATTEMPTS = 3;
+        const RETRY_DELAY_MS = 1000;
         
-        // Try to refresh token and retry the request once
-        const newToken = await getValidAccessToken(context);
-        if (newToken && newToken !== accessToken) { // Ensure we got a different token
-          console.log('[FROLIC] Token refreshed, retrying digest upload...');
+        for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+          console.log(`[FROLIC] Auth retry attempt ${attempt}/${MAX_RETRY_ATTEMPTS}`);
           
-          // Retry the request with new token
-          const retryRes = await fetchWithTimeout(apiUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${newToken}`,
-              'Content-Type': 'application/json',
-              'User-Agent': 'VSCode-Frolic-Extension/1.0.26'
-            },
-            body: JSON.stringify({ sessionId, digest })
-          }, 30000);
+          // Clear access token to force refresh on next attempt
+          await context.secrets.delete('frolic.accessToken');
           
-          if (retryRes.ok) {
-            console.log('[FROLIC] Digest uploaded successfully after token refresh');
-            return await retryRes.json();
-          } else {
-            const retryErrorText = await retryRes.text();
-            console.log(`[FROLIC] Retry after token refresh failed: ${retryRes.status} ${retryErrorText}`);
+          // Wait with exponential backoff (except on first attempt)
+          if (attempt > 1) {
+            const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 2);
+            console.log(`[FROLIC] Waiting ${delay}ms before retry`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+          
+          // Try to get a fresh token
+          const newToken = await getValidAccessToken(context);
+          if (newToken && newToken !== accessToken) {
+            console.log('[FROLIC] Got fresh token, retrying digest upload...');
             
-            // If the refreshed token also fails, clear everything and force re-authentication
-            if (retryRes.status === 401) {
-              console.log('[FROLIC] Refreshed token also rejected - clearing all auth state');
-              await clearAllAuthTokens(context);
-              updateStatusBar('unauthenticated');
+            // Retry the request with new token
+            const retryRes = await fetchWithTimeout(apiUrl, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${newToken}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
+              },
+              body: JSON.stringify({ sessionId, digest })
+            }, 30000);
+            
+            if (retryRes.ok) {
+              console.log('[FROLIC] Digest uploaded successfully after token refresh (attempt ' + attempt + ')');
+              return await retryRes.json();
+            } else {
+              const retryErrorText = await retryRes.text();
+              console.log(`[FROLIC] Retry ${attempt} failed: ${retryRes.status} ${retryErrorText}`);
               
-              // Don't automatically prompt - this was causing the loop!
-              // Just update status bar and let user manually sign in
-              console.log('[FROLIC] Authentication expired. User will need to manually sign in.');
+              // Continue to next attempt unless this was the last one
+              if (attempt === MAX_RETRY_ATTEMPTS) {
+                // Check network connectivity before giving up
+                const hasNetwork = await checkNetworkConnectivity();
+                
+                if (!hasNetwork) {
+                  console.log('[FROLIC] No network connectivity - queueing digest for later');
+                  // Queue for offline processing instead of failing
+                  queueDigestForOfflineProcessing(sessionId, digest);
+                  // Show non-intrusive notification
+                  vscode.window.setStatusBarMessage(
+                    '$(cloud-offline) Frolic: Working offline, will sync when reconnected',
+                    10000
+                  );
+                  return { queued: true };
+                } else if (retryRes.status === 401) {
+                  // Only clear all tokens after exhausting retries with network available
+                  console.log('[FROLIC] All retry attempts failed with 401 - clearing all auth state');
+                  await clearAllAuthTokens(context);
+                  updateStatusBar('unauthenticated');
+                  console.log('[FROLIC] Authentication expired. User will need to manually sign in.');
+                }
+                throw new Error('AUTH_TOKEN_EXPIRED');
+              }
             }
+          } else if (attempt === MAX_RETRY_ATTEMPTS) {
+            console.log('[FROLIC] Could not refresh token after all attempts');
+            await clearAllAuthTokens(context);
+            updateStatusBar('unauthenticated');
             throw new Error('AUTH_TOKEN_EXPIRED');
           }
-        } else {
-          console.log('[FROLIC] Could not refresh token or got same token back');
-          await clearAllAuthTokens(context);
-          updateStatusBar('unauthenticated');
-          throw new Error('AUTH_TOKEN_EXPIRED');
         }
       } else if (res.status === 403) {
         console.error('[FROLIC] Access forbidden - check API permissions');
