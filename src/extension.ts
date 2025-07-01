@@ -178,7 +178,10 @@ function getCurrentSessionContext(): any {
         activeFile: activeEditor?.document.fileName,
         language: activeEditor?.document.languageId,
         lineCount: activeEditor?.document.lineCount,
-        cursorPosition: activeEditor?.selection.active,
+        cursorPosition: activeEditor?.selection.active ? {
+            line: activeEditor.selection.active.line,
+            character: activeEditor.selection.active.character
+        } : null,
         recentFiles: recentFileOpenings.slice(-3).map(f => f.file)
     };
 }
@@ -384,7 +387,10 @@ function logEvent(eventType: string, data: any) {
         lineCount: data.lineCount ?? 0,
         isDirty: data.isDirty ?? false,
         isUntitled: data.isUntitled ?? false,
-        cursorPosition: data.cursorPosition ?? null,
+        cursorPosition: data.cursorPosition ? {
+            line: data.cursorPosition.line || 0,
+            character: data.cursorPosition.character || 0
+        } : null,
         selectionLength: data.selectionLength ?? 0,
         changes: (data.changes ?? []).map((c: any) => {
             // Truncate very large changes to prevent memory issues
@@ -1454,7 +1460,7 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
+        'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
       },
       body: JSON.stringify({ refresh_token: refreshToken })
     }, 15000); // 15 second timeout for refresh
@@ -2169,7 +2175,7 @@ function analyzeLogs(logs: any[]): any {
         method: 'POST',
                   headers: { 
             'Content-Type': 'application/json',
-            'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
+            'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
           },
         body: JSON.stringify({ 
           code: code.trim(), 
@@ -3517,15 +3523,24 @@ export async function sendDigestToBackend(
 
   // Token validation successful (removed verbose logging)
 
+  // 🔧 FIX: Add JSON serialization safety check to prevent circular reference errors
+  let serializedBody: string;
+  try {
+    serializedBody = JSON.stringify({ sessionId, digest });
+  } catch (jsonError) {
+    console.error('[FROLIC] JSON serialization failed - circular reference detected:', jsonError);
+    throw new Error(`JSON_SERIALIZATION_ERROR: ${jsonError instanceof Error ? jsonError.message : 'Unknown error'}`);
+  }
+
   try {
     const res = await fetchWithTimeout(apiUrl, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
+        'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
       },
-      body: JSON.stringify({ sessionId, digest })
+      body: serializedBody
     }, 30000); // 30 second timeout
 
     if (res.ok) {
@@ -3606,15 +3621,15 @@ export async function sendDigestToBackend(
           if (newToken && newToken !== accessToken) {
             console.log('[FROLIC] Got fresh token, retrying digest upload...');
             
-            // Retry the request with new token
+            // Retry the request with new token (reuse the already-serialized body)
             const retryRes = await fetchWithTimeout(apiUrl, {
               method: 'POST',
               headers: {
                 'Authorization': `Bearer ${newToken}`,
                 'Content-Type': 'application/json',
-                'User-Agent': 'VSCode-Frolic-Extension/1.0.29'
+                'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
               },
-              body: JSON.stringify({ sessionId, digest })
+              body: serializedBody
             }, 30000);
             
             if (retryRes.ok) {
