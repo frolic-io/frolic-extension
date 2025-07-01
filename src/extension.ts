@@ -12,6 +12,9 @@ const MAX_CHANGE_TEXT_LENGTH = 2000; // Truncate very large code changes
 let isLoggingEnabled = true;
 let sessionId = crypto.randomUUID();
 let digestTimer: NodeJS.Timeout | null = null;
+let lastDigestSentTime = 0; // Track when we last sent a digest
+let pendingDigestSend = false; // Debounce flag for digest sends
+let isFirstDigestSent = false; // Track if we've sent the first digest for onboarding
 let bufferMemoryUsage = 0; // Track estimated memory usage in bytes
 let statusBarItem: vscode.StatusBarItem;
 let activityProvider: FrolicActivityProvider | undefined;
@@ -35,9 +38,7 @@ const MICRO_SESSION_THRESHOLD = 10; // Backup after 10 events (for short bursts)
 const INACTIVITY_BACKUP_DELAY = 3 * 60 * 1000; // 3 minutes of inactivity
 const QUICK_FIX_THRESHOLD = 5; // Backup after 5 events if 2+ minutes since last activity
 
-// 🔄 PHASE 2.1: Smart Notification Throttling - Global state
-let lastNotificationTime = 0;
-let digestsSentSinceLastNotification = 0;
+// Removed notification throttling - now only showing notifications for first digest and manual sends
 
 // 🔄 ENHANCED: Background token refresh management
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
@@ -93,10 +94,62 @@ const FREQUENT_SWITCHING_THRESHOLD = 8; // 8 file switches within 2 minutes
 const FREQUENT_SWITCHING_TIME_WINDOW = 2 * 60 * 1000; // 2 minutes
 const ERROR_HEAVY_SESSION_THRESHOLD = 10; // 10+ errors in a file
 
-function getNotificationThrottleMs(): number {
+// Removed getNotificationThrottleMs - notifications now only for first digest and manual sends
+
+// Path validation utilities
+function isValidPath(filePath: string): boolean {
+    if (!filePath || typeof filePath !== 'string') {
+        return false;
+    }
+    
+    // Check for path traversal attempts
+    if (filePath.includes('..') || filePath.includes('~')) {
+        return false;
+    }
+    
+    // Check for null bytes
+    if (filePath.includes('\0')) {
+        return false;
+    }
+    
+    return true;
+}
+
+function sanitizePath(filePath: string): string {
+    if (!isValidPath(filePath)) {
+        console.warn('[FROLIC] Invalid path detected:', filePath);
+        return '';
+    }
+    
+    // Remove any potentially dangerous characters
+    return filePath.replace(/[<>:"|?*]/g, '');
+}
+
+// Privacy mode utilities
+function hashPath(filePath: string): string {
+    // Use a simple hash function for privacy mode
+    // This provides consistency across sessions while protecting actual paths
+    const crypto = require('crypto');
+    const hash = crypto.createHash('sha256');
+    hash.update(filePath);
+    const fullHash = hash.digest('hex');
+    
+    // Keep file extension for language detection
+    const ext = path.extname(filePath);
+    
+    // Return first 8 chars of hash + extension
+    return `file_${fullHash.substring(0, 8)}${ext}`;
+}
+
+function getPrivacyModePath(filePath: string): string {
     const config = vscode.workspace.getConfiguration('frolic');
-    const hours = config.get<number>('notificationFrequencyHours', 24);
-    return hours * 60 * 60 * 1000; // Convert hours to milliseconds
+    const privacyMode = config.get<boolean>('privacyMode', false);
+    
+    if (privacyMode && filePath) {
+        return hashPath(filePath);
+    }
+    
+    return filePath;
 }
 
 // Get configurable limits
@@ -302,15 +355,31 @@ function cleanupOldErrorData() {
 function logEvent(eventType: string, data: any) {
     if (!isLoggingEnabled) return;
 
-    const filePath = data.file ?? "";
+    const rawFilePath = data.file ?? "";
+    
+    // Validate and sanitize the file path
+    if (!isValidPath(rawFilePath)) {
+        console.warn('[FROLIC] Skipping event due to invalid file path');
+        return;
+    }
+    
+    const filePath = sanitizePath(rawFilePath);
     if (filePath.includes(".git") || filePath.startsWith("git/") || filePath === "exthost") return;
+
+    // Apply privacy mode if enabled
+    const privacyPath = getPrivacyModePath(filePath);
+    const privacyRelativePath = getPrivacyModePath(vscode.workspace.asRelativePath(filePath));
+    
+    // Check if AI detection is disabled
+    const config = vscode.workspace.getConfiguration('frolic');
+    const disableAIDetection = config.get<boolean>('disableAIDetection', false);
 
     const entry = {
         timestamp: new Date().toISOString(),
         sessionId,
         eventType,
-        file: filePath,
-        relativePath: vscode.workspace.asRelativePath(filePath),
+        file: privacyPath,
+        relativePath: privacyRelativePath,
         language: data.language ?? "unknown",
         lineCount: data.lineCount ?? 0,
         isDirty: data.isDirty ?? false,
@@ -327,10 +396,10 @@ function logEvent(eventType: string, data: any) {
             }
             
             return {
-            textLength: c.textLength,
-            rangeLength: c.rangeLength,
-            lineCountDelta: (c.text.match(/\n/g) || []).length,
-            likelyAI: c.textLength > 100 && c.rangeLength === 0,
+                textLength: c.textLength,
+                rangeLength: c.rangeLength,
+                lineCountDelta: (c.text.match(/\n/g) || []).length,
+                likelyAI: disableAIDetection ? false : (c.textLength > 100 && c.rangeLength === 0),
                 changeText: changeText,
                 wasTruncated: wasTruncated
             };
@@ -2299,6 +2368,9 @@ export async function activate(context: vscode.ExtensionContext) {
         console.log(`[FROLIC] ✅ Successfully recovered ${recoveredEvents} events from previous session`);
     }
 
+    // Load first digest sent state
+    isFirstDigestSent = context.globalState.get('frolic.firstDigestSent', false);
+
     // Create and register tree view
     activityProvider = new FrolicActivityProvider(context);
     const treeView = vscode.window.createTreeView('frolic-activity', {
@@ -2597,15 +2669,21 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(editor => {
             if (editor && editor.document.fileName) {
+                // Validate file path before processing
+                if (!isValidPath(editor.document.fileName)) {
+                    return;
+                }
+                
                 const now = Date.now();
-                detectFrequentFileSwitching(editor.document.fileName, now);
+                const sanitizedPath = sanitizePath(editor.document.fileName);
+                detectFrequentFileSwitching(sanitizedPath, now);
                 
                 // Log file switch action
                 userActionHistory.push({
                     timestamp: now,
                     action: 'file_switch',
                     context: {
-                        fileName: editor.document.fileName,
+                        fileName: sanitizedPath,
                         language: editor.document.languageId
                     }
                 });
@@ -2635,7 +2713,14 @@ export async function activate(context: vscode.ExtensionContext) {
             event.uris.forEach(uri => {
                 const currentDiagnostics = vscode.languages.getDiagnostics(uri);
                 const timestamp = Date.now();
-                const filePath = uri.fsPath;
+                const rawFilePath = uri.fsPath;
+                
+                // Validate file path
+                if (!isValidPath(rawFilePath)) {
+                    return;
+                }
+                
+                const filePath = sanitizePath(rawFilePath);
                 
                 // Skip if it's a git file or other excluded path
                 if (filePath.includes('.git') || filePath.startsWith('git/')) {
@@ -2858,10 +2943,37 @@ function startPeriodicDigestSending(context: vscode.ExtensionContext) {
     }
     
     digestTimer = setInterval(async () => {
+        // Check if enough time has passed since last digest to prevent rapid-fire sends after system wake
+        const timeSinceLastDigest = Date.now() - lastDigestSentTime;
+        const minIntervalMs = intervalMs * 0.9; // Allow 10% early to account for timer drift
+        
+        if (timeSinceLastDigest < minIntervalMs) {
+            console.log(`[FROLIC] Skipping digest - only ${Math.round(timeSinceLastDigest/1000/60)} minutes since last send (min: ${Math.round(minIntervalMs/1000/60)} minutes)`);
+            return;
+        }
+        
+        // Debounce check - if a digest is already pending, skip this one
+        if (pendingDigestSend) {
+            console.log('[FROLIC] Digest send already pending, skipping duplicate');
+            return;
+        }
+        
+        pendingDigestSend = true;
+        
+        // Check if this is a "catch-up" digest after system wake
+        // If much more time has passed than expected, it's likely the system was asleep
+        const isCatchUpDigest = timeSinceLastDigest > intervalMs * 1.5; // 50% over expected interval
+        
         // Add some jitter to prevent thundering herd if many users have same interval
         const jitter = Math.random() * 60000; // 0-1 minute random delay
         setTimeout(async () => {
-            await sendDigestImmediately(context, 3, true); // Show notification for periodic digests
+            try {
+                // Never show notifications for periodic digests
+                console.log('[FROLIC] Sending periodic digest (no notification)');
+                await sendDigestImmediately(context, 3, false);
+            } finally {
+                pendingDigestSend = false;
+            }
         }, jitter);
     }, intervalMs);
 
@@ -2889,6 +3001,7 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 LOG_BUFFER.length = 0;
                 bufferMemoryUsage = 0; // Reset memory tracking
                 sessionId = crypto.randomUUID();
+                lastDigestSentTime = Date.now(); // Record when we sent this digest
                 
                 // Reset session timer in activity panel
                 if (activityProvider) {
@@ -2898,23 +3011,13 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
                 updateStatusBar('authenticated');
                 
-                // 🔄 PHASE 2.1: Smart notification throttling
-                digestsSentSinceLastNotification++;
-                const timeSinceLastNotification = Date.now() - lastNotificationTime;
-                const notificationThrottleMs = getNotificationThrottleMs();
-                const shouldShowNotification = showNotification && (
-                    timeSinceLastNotification >= notificationThrottleMs || // Configurable hours since last
-                    digestsSentSinceLastNotification >= 25 // Or 25+ digests sent (fallback)
-                );
-                
-                if (shouldShowNotification) {
-                    const message = digestsSentSinceLastNotification > 1 
-                        ? `✅ Digest sent successfully! (${digestsSentSinceLastNotification} sessions processed)`
-                        : `✅ Digest sent successfully! (${eventCount} events processed)`;
-                    
-                    vscode.window.showInformationMessage(message);
-                    lastNotificationTime = Date.now();
-                    digestsSentSinceLastNotification = 0; // Reset counter
+                // Only show notification for first digest (onboarding) or if explicitly requested
+                if (showNotification && !isFirstDigestSent) {
+                    // First digest notification for onboarding
+                    vscode.window.showInformationMessage(`✅ Frolic is now tracking your coding activity! Your first digest has been sent.`);
+                    isFirstDigestSent = true;
+                    // Store this state so we don't show it again
+                    context.globalState.update('frolic.firstDigestSent', true);
                 }
                 
                 return eventCount; // Return the number of events processed
@@ -3046,7 +3149,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
 
             // Last digest status (always visible)
             items.push(new FrolicTreeItem(
-                '📧 Last digest: just now',
+                'Last digest: just now',
                 vscode.TreeItemCollapsibleState.None,
                 'digest-status',
                 undefined,
@@ -3056,7 +3159,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             // Send digest action (always visible)
             const digestReady = LOG_BUFFER.length >= 1000;
             items.push(new FrolicTreeItem(
-                digestReady ? '📤 Send Digest (Ready!)' : `📤 Send Digest (${LOG_BUFFER.length}/1000)`,
+                digestReady ? 'Send Digest (Ready!)' : `Send Digest (${LOG_BUFFER.length}/1000)`,
                 vscode.TreeItemCollapsibleState.None,
                 'action-send-digest',
                 {
@@ -3069,7 +3172,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             // Recent activity summary (always visible)
             const recentActivity = this.getRecentActivity();
             items.push(new FrolicTreeItem(
-                `🔥 Recent: ${recentActivity} edits/5m`,
+                `Recent: ${recentActivity} edits/5m`,
                 vscode.TreeItemCollapsibleState.None,
                 'activity-summary',
                 undefined,
@@ -3078,7 +3181,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
 
             // Details section (collapsed by default - contains all the detailed metrics)
             items.push(new FrolicTreeItem(
-                '📊 Details',
+                'Details',
                 vscode.TreeItemCollapsibleState.Collapsed,
                 'details-section'
             ));
@@ -3099,7 +3202,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             const bufferMemoryMB = (bufferMemoryUsage / 1024 / 1024).toFixed(1);
             
             items.push(new FrolicTreeItem(
-                `📝 Events: ${totalEvents}`,
+                `Events: ${totalEvents}`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3107,7 +3210,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                `📁 Files: ${filesEdited}`,
+                `Files: ${filesEdited}`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3115,7 +3218,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                `📏 Lines: +${totalLines}`,
+                `Lines: +${totalLines}`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3123,7 +3226,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                `🤖 AI Assists: ${aiInsertions}`,
+                `AI Assists: ${aiInsertions}`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3131,7 +3234,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                `⚡ Velocity: ${codingVelocity}/min`,
+                `Velocity: ${codingVelocity}/min`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3139,7 +3242,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                `💾 Buffer: ${bufferMemoryMB}MB`,
+                `Buffer: ${bufferMemoryMB}MB`,
                 vscode.TreeItemCollapsibleState.None,
                 'detail-stat',
                 undefined,
@@ -3150,7 +3253,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             const activeFiles = this.getActiveFiles();
             if (activeFiles.length > 0) {
                 items.push(new FrolicTreeItem(
-                    `📁 Top Files (${activeFiles.length})`,
+                    `Top Files (${activeFiles.length})`,
                     vscode.TreeItemCollapsibleState.Collapsed,
                     'active-files'
                 ));
@@ -3160,7 +3263,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             const insights = this.generateInsights();
             if (insights.length > 0) {
                 items.push(new FrolicTreeItem(
-                    `💡 Insights (${insights.length})`,
+                    `Insights (${insights.length})`,
                     vscode.TreeItemCollapsibleState.Collapsed,
                     'insights'
                 ));
@@ -3168,7 +3271,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
 
             // Add additional actions
             items.push(new FrolicTreeItem(
-                '📝 Write Logs to File',
+                'Write Logs to File',
                 vscode.TreeItemCollapsibleState.None,
                 'action-write-logs',
                 {
@@ -3179,7 +3282,7 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             ));
             
             items.push(new FrolicTreeItem(
-                '🔄 Refresh Panel',
+                'Refresh Panel',
                 vscode.TreeItemCollapsibleState.None,
                 'action-refresh',
                 {
@@ -3284,33 +3387,33 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         const topLanguage = Object.entries(languages).sort((a, b) => b[1] - a[1])[0];
         
         if (topLanguage) {
-            insights.push(`🎯 Focus: ${topLanguage[0]} (${topLanguage[1]} edits)`);
+            insights.push(`Focus: ${topLanguage[0]} (${topLanguage[1]} edits)`);
         }
         
         const sessionDuration = (Date.now() - this.sessionStartTime.getTime()) / 1000 / 60;
         if (sessionDuration > 30) {
-            insights.push(`🔥 Deep focus: ${Math.round(sessionDuration)}m session`);
+            insights.push(`Deep focus: ${Math.round(sessionDuration)}m session`);
         }
         
         const aiAssists = this.getAIInsertions();
         if (aiAssists === 0 && LOG_BUFFER.length > 10) {
-            insights.push('💪 Independent coding streak!');
+            insights.push('Independent coding streak!');
         } else if (aiAssists > 0) {
-            insights.push(`🤖 AI-assisted development (${aiAssists})`);
+            insights.push(`AI-assisted development (${aiAssists})`);
         }
         
         const uniqueFiles = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
         if (uniqueFiles > 5) {
-            insights.push(`🌐 Multi-file project (${uniqueFiles} files)`);
+            insights.push(`Multi-file project (${uniqueFiles} files)`);
         }
         
         const recentActivity = this.getRecentActivity();
         if (recentActivity > 10) {
-            insights.push('🚀 High activity period!');
+            insights.push('High activity period!');
         }
         
         if (insights.length === 0) {
-            insights.push('✨ Keep coding to see insights!');
+            insights.push('Keep coding to see insights!');
         }
         
         return insights.slice(0, 3); // Max 3 insights to avoid clutter
@@ -3344,19 +3447,19 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
     private getFileIcon(filename: string): string {
         const ext = filename.split('.').pop()?.toLowerCase();
         const iconMap: {[key: string]: string} = {
-            'ts': '🟦', 'tsx': '⚛️', 'js': '🟨', 'jsx': '⚛️',
-            'py': '🐍', 'java': '☕', 'cpp': '⚙️', 'c': '⚙️', 'cs': '💜',
-            'html': '🌐', 'css': '🎨', 'scss': '🎨', 'sass': '🎨',
-            'json': '📋', 'md': '📝', 'txt': '📄', 'yml': '🔧', 'yaml': '🔧',
-            'go': '🐹', 'rs': '🦀', 'php': '🐘', 'rb': '💎'
+            'ts': 'TS', 'tsx': 'TSX', 'js': 'JS', 'jsx': 'JSX',
+            'py': 'PY', 'java': 'JAVA', 'cpp': 'CPP', 'c': 'C', 'cs': 'CS',
+            'html': 'HTML', 'css': 'CSS', 'scss': 'SCSS', 'sass': 'SASS',
+            'json': 'JSON', 'md': 'MD', 'txt': 'TXT', 'yml': 'YML', 'yaml': 'YAML',
+            'go': 'GO', 'rs': 'RS', 'php': 'PHP', 'rb': 'RB'
         };
-        return iconMap[ext || ''] || '📄';
+        return iconMap[ext || ''] || 'FILE';
     }
 
     private async getAuthStatusItems(): Promise<FrolicTreeItem[]> {
         const accessToken = await getValidAccessToken(this.context);
         const status = accessToken ? 'authenticated' : 'unauthenticated';
-        const label = status === 'authenticated' ? `🚪Sign Out` : '⚠️Sign In';
+        const label = status === 'authenticated' ? `Sign Out` : 'Sign In';
         
         return [
             new FrolicTreeItem(
@@ -3440,7 +3543,38 @@ export async function sendDigestToBackend(
       const errorText = await res.text();
       
       // Handle specific HTTP status codes
-      if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
+      if (res.status === 429) {
+        // Rate limiting - don't treat as auth failure, just wait and retry
+        console.log('[FROLIC] Rate limited by server:', {
+          status: res.status,
+          error: errorText,
+          retryAfter: res.headers.get('Retry-After') || 'unknown'
+        });
+        
+        // Extract retry-after header or default to 60 seconds
+        const retryAfter = parseInt(res.headers.get('Retry-After') || '60', 10);
+        const waitTime = Math.min(retryAfter * 1000, 120000); // Cap at 2 minutes
+        
+        console.log(`[FROLIC] Waiting ${waitTime}ms due to rate limiting`);
+        
+        // Queue digest for offline processing instead of blocking
+        queueDigestForOfflineProcessing(sessionId, digest);
+        
+        // Show user-friendly message
+        vscode.window.setStatusBarMessage(
+          `$(clock) Frolic: Rate limited, queued for retry in ${Math.round(waitTime/1000)}s`,
+          waitTime
+        );
+        
+        // Process the queue after waiting
+        setTimeout(() => {
+          processOfflineDigestQueue(context).catch(error => {
+            console.log('[FROLIC] Error processing rate limit queue:', error.message);
+          });
+        }, waitTime);
+        
+        return { queued: true, reason: 'rate_limited', retryAfter: waitTime };
+      } else if (res.status === 401 || (res.status === 403 && errorText.includes('token is expired'))) {
         // Backend rejected token - implement smart retry logic before clearing
         console.log('[FROLIC] Backend rejected token with 401/403:', {
           status: res.status,
