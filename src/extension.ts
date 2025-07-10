@@ -2421,6 +2421,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // Track file edits
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((event) => {
+            // Skip if no actual content changes (e.g., cursor movements)
+            if (event.contentChanges.length === 0) {
+                return;
+            }
+            
+            // Debug logging to verify changes are being captured
+            const totalChangeLength = event.contentChanges.reduce((sum, change) => sum + change.text.length, 0);
+            console.log(`[FROLIC] Capturing ${event.contentChanges.length} changes (${totalChangeLength} chars) in ${event.document.fileName}`);
+            
             const editor = vscode.window.activeTextEditor;
             const doc = event.document;
 
@@ -2462,6 +2471,116 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // Show Frolic dropdown (similar to GitHub Copilot)
+    const showDropdownCmd = vscode.commands.registerCommand('frolic.showDropdown', async () => {
+        const accessToken = await getValidAccessToken(context);
+        const isAuthenticated = !!accessToken;
+        
+        // Get current activity stats
+        const totalEvents = LOG_BUFFER.length;
+        const filesEdited = new Set(LOG_BUFFER.map(e => e.relativePath)).size;
+        const bufferMemoryMB = (bufferMemoryUsage / 1024 / 1024).toFixed(1);
+        const recentActivity = LOG_BUFFER.filter(e => 
+            e.eventType === 'file_edit' && 
+            Date.now() - e.timestamp < 5 * 60 * 1000
+        ).length;
+        
+        const digestProgress = Math.min(100, (totalEvents / 1000) * 100);
+        const digestReady = totalEvents >= 1000;
+        
+        // Create QuickPick items
+        const items: vscode.QuickPickItem[] = [];
+        
+        // Header - Connection Status
+        items.push({
+            label: `${isAuthenticated ? 'Connected' : 'Disconnected'}`,
+            description: isAuthenticated ? 'Frolic is tracking your activity' : 'Sign in to enable tracking',
+            kind: vscode.QuickPickItemKind.Separator
+        });
+        
+        // Activity metrics
+        items.push({
+            label: `${totalEvents} events logged`,
+            description: `${filesEdited} files edited, ${recentActivity} recent edits`,
+            kind: vscode.QuickPickItemKind.Default
+        });
+        
+        items.push({
+            label: `${bufferMemoryMB}MB buffer usage`,
+            description: `Memory usage for event tracking`,
+            kind: vscode.QuickPickItemKind.Default
+        });
+        
+        // Digest status
+        items.push({
+            label: `Digest: ${totalEvents}/1000 events`,
+            description: digestReady ? 'Ready to send!' : `${digestProgress.toFixed(0)}% complete`,
+            kind: vscode.QuickPickItemKind.Default
+        });
+        
+        // Separator for actions
+        items.push({
+            label: '',
+            kind: vscode.QuickPickItemKind.Separator
+        });
+        
+        // Actions
+        if (isAuthenticated) {
+            items.push({
+                label: `Send Digest`,
+                description: digestReady ? 'Send your activity digest now' : `Send digest with ${totalEvents} events`
+            });
+        }
+        
+        items.push({
+            label: `Refresh`,
+            description: 'Update activity stats'
+        });
+        
+        if (isAuthenticated) {
+            items.push({
+                label: `Sign Out`,
+                description: 'Sign out of Frolic'
+            });
+        } else {
+            items.push({
+                label: `Sign In`,
+                description: 'Connect to Frolic'
+            });
+        }
+        
+        // Show QuickPick
+        const quickPick = vscode.window.createQuickPick();
+        quickPick.items = items;
+        quickPick.placeholder = 'Frolic Status & Actions';
+        quickPick.title = 'Frolic';
+        quickPick.canSelectMany = false;
+        
+        // Handle selection
+        quickPick.onDidAccept(async () => {
+            const selection = quickPick.selectedItems[0];
+            if (selection?.label) {
+                if (selection.label.includes('Send Digest')) {
+                    await vscode.commands.executeCommand('frolic.sendDigest');
+                } else if (selection.label.includes('Sign Out')) {
+                    await vscode.commands.executeCommand('frolic.signOut');
+                } else if (selection.label.includes('Sign In')) {
+                    await vscode.commands.executeCommand('frolic.signIn');
+                } else if (selection.label.includes('Refresh')) {
+                    // Close and reopen to refresh
+                    quickPick.dispose();
+                    await vscode.commands.executeCommand('frolic.showDropdown');
+                    return;
+                }
+            }
+            quickPick.dispose();
+        });
+        
+        quickPick.onDidHide(() => quickPick.dispose());
+        quickPick.show();
+    });
+    context.subscriptions.push(showDropdownCmd);
 
     // Manual flush command - writes to file and optionally sends digest
     const flushCommand = vscode.commands.registerCommand('frolic.flushLogs', async () => {
@@ -3082,15 +3201,15 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'authenticated':
             statusBarItem.text = '$(check) Frolic Connected';
-            statusBarItem.tooltip = `Frolic: Connected and tracking activity (${LOG_BUFFER.length} events logged). Click to sign out.`;
+            statusBarItem.tooltip = `Frolic: Connected and tracking activity (${LOG_BUFFER.length} events logged). Click to view status.`;
             statusBarItem.backgroundColor = undefined;
-            statusBarItem.command = 'frolic.signOut';
+            statusBarItem.command = 'frolic.showDropdown';
             break;
         case 'unauthenticated':
             statusBarItem.text = '$(sign-in) Connect Frolic';
-            statusBarItem.tooltip = 'Frolic: Click to connect and enable personalized coding insights';
+            statusBarItem.tooltip = 'Frolic: Click to view status and connect';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-            statusBarItem.command = 'frolic.signIn';
+            statusBarItem.command = 'frolic.showDropdown';
             break;
         case 'sending':
             statusBarItem.text = '$(cloud-upload) Frolic';
@@ -3100,9 +3219,9 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'error':
             statusBarItem.text = '$(error) Frolic';
-            statusBarItem.tooltip = 'Frolic: Connection error. Click to sign in.';
+            statusBarItem.tooltip = 'Frolic: Connection error. Click to view status.';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
-            statusBarItem.command = 'frolic.signIn';
+            statusBarItem.command = 'frolic.showDropdown';
             break;
     }
     statusBarItem.show();
@@ -3700,4 +3819,5 @@ export async function sendDigestToBackend(
     }
   }
 }
+
 
