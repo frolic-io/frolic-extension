@@ -5,6 +5,37 @@ All notable changes to the Frolic extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2025-01-12
+
+### Added
+- Skills dashboard quick pick view accessible from "Frolic Connected" status bar
+- "Show more" feature displaying top 3 skills with option to expand all 10
+- Skills command `frolic.openSkills` to view progress
+- API integration with frolic-app skills endpoint using JWT authentication
+
+### Changed
+- Clicking "Frolic Connected" now opens skills view instead of dropdown
+- Improved skills progress calculation to match web app logic
+- Action buttons now appear at bottom of skills list
+
+### Fixed
+- Skills display now shows only the correct 10 skills from technical design
+- Progress bar calculations now properly clamped between 0-100%
+- Removed duplicate skills and incorrect skill names
+
+## [1.1.2] - 2025-01-04
+
+### Fixed
+- Fixed critical bug where code changes were not being captured in digests
+- Extension was recording empty contentChanges arrays for cursor movements and selections
+- Added filter to only capture actual text changes, not cursor/selection events
+- Digests now properly include code diffs in codeChangesSample array
+
+### Improved
+- Better code change tracking accuracy
+- Reduced noise from non-content change events
+- More reliable digest significance detection
+
 ## [1.0.15] - 2024-12-28
 
 ### Removed

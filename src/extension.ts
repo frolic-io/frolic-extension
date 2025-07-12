@@ -2728,6 +2728,265 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     context.subscriptions.push(signOutCmd);
 
+    // Register open skills webview command
+    const openSkillsCmd = vscode.commands.registerCommand('frolic.openSkills', async () => {
+        try {
+            // Check if authenticated first
+            const accessToken = await getValidAccessToken(context);
+            if (!accessToken) {
+                // Show sign in options
+                const quickPick = vscode.window.createQuickPick();
+                quickPick.title = 'Frolic Skills';
+                quickPick.placeholder = 'Sign in to view your skills progress';
+                quickPick.items = [
+                    {
+                        label: 'Sign In Required',
+                        kind: vscode.QuickPickItemKind.Separator
+                    },
+                    {
+                        label: '$(sign-in) Sign In to Frolic',
+                        description: 'Connect your VS Code to view skills progress'
+                    },
+                    {
+                        label: '',
+                        kind: vscode.QuickPickItemKind.Separator
+                    },
+                    {
+                        label: '$(globe) Open Frolic Dashboard',
+                        description: 'View full dashboard in browser'
+                    }
+                ];
+                
+                quickPick.onDidAccept(() => {
+                    const selection = quickPick.selectedItems[0];
+                    if (selection?.label.includes('Sign In')) {
+                        quickPick.dispose();
+                        vscode.commands.executeCommand('frolic.signIn');
+                    } else if (selection?.label.includes('Open Frolic Dashboard')) {
+                        vscode.env.openExternal(vscode.Uri.parse(`${getApiBaseUrl()}/skills`));
+                        quickPick.dispose();
+                    }
+                });
+                
+                quickPick.show();
+                return;
+            }
+            
+            // Show loading quick pick
+            const quickPick = vscode.window.createQuickPick();
+            quickPick.title = 'Frolic Skills';
+            quickPick.placeholder = 'Loading skills data...';
+            quickPick.busy = true;
+            quickPick.items = [];
+            quickPick.show();
+            
+            let showAllSkills = false; // Track whether to show all skills or just top 3
+            
+            // Fetch skills data from API
+            try {
+                const skillsData = await fetchSkillsData(context);
+                console.log('[FROLIC] Skills data received:', skillsData);
+            
+            const renderSkills = (skills: any[], showAll: boolean = false) => {
+                console.log('[FROLIC] Rendering skills, showAll:', showAll);
+                
+                // Filter to only the correct 10 skills from the technical design
+                const CORRECT_SKILLS = [
+                    'Programming Fundamentals',
+                    'Software Design & Architecture', 
+                    'Frontend Development',
+                    'Backend Development',
+                    'DevOps & Infrastructure',
+                    'Security & Auth',
+                    'Testing & Quality Assurance',
+                    'Developer Tooling & Workflow',
+                    'Team Collaboration & Project Skills',
+                    'AI, Learning, & Prompting'
+                ];
+                
+                // Transform skills into QuickPick items
+                const items: vscode.QuickPickItem[] = [];
+                
+                // Add skills separator first
+                items.push({
+                    label: 'Your Skills Progress',
+                    kind: vscode.QuickPickItemKind.Separator
+                });
+                
+                // Create skills display using the same logic as the web app
+                // Sort skills by total points to show top 3
+                const skillsWithData = CORRECT_SKILLS.map(skillName => {
+                    const skillData = skills.find(s => s.skill_name === skillName);
+                    return {
+                        name: skillName,
+                        data: skillData,
+                        totalPoints: skillData?.total_points || 0
+                    };
+                }).sort((a, b) => b.totalPoints - a.totalPoints);
+                
+                // Show either top 3 or all skills based on showAll flag
+                const skillsToShow = showAll ? skillsWithData : skillsWithData.slice(0, 3);
+                
+                skillsToShow.forEach(({ name: skillName, data: skillData }) => {
+                    if (skillData) {
+                        // Use the same progress calculation as the web app
+                        const totalPoints = skillData.total_points || 0;
+                        const currentLevel = skillData.current_level || 1;
+                        const pointsToNext = skillData.points_to_next_level || 10;
+                        
+                        // Calculate progress within current level (not overall)
+                        // This matches how the web app calculates progress
+                        const pointsInCurrentLevel = totalPoints - (totalPoints - pointsToNext);
+                        const pointsNeededForLevel = currentLevel === 1 ? 10 : pointsToNext + pointsInCurrentLevel;
+                        const progress = pointsNeededForLevel > 0 ? Math.round((pointsInCurrentLevel / pointsNeededForLevel) * 100) : 0;
+                        const progressBar = createProgressBar(progress);
+                        
+                        items.push({
+                            label: `$(book) ${skillName}`,
+                            description: `Level ${currentLevel} • ${progressBar} ${progress}%`,
+                            detail: `Points: ${totalPoints} • Next level in ${pointsToNext} pts • Digest: ${skillData.points_breakdown?.digest || 0} • Quiz: ${skillData.points_breakdown?.skill_quiz || 0}`
+                        });
+                    } else {
+                        // Show default for missing skills
+                        items.push({
+                            label: `$(book) ${skillName}`,
+                            description: `Level 1 • ${'░'.repeat(10)} 0%`,
+                            detail: `Points: 0 • Next level in 10 pts • Start earning points to level up!`
+                        });
+                    }
+                });
+                
+                // Add "Show All Skills" option if not showing all and there are more than 3 skills
+                if (!showAll && skillsWithData.length > 3) {
+                    items.push({
+                        label: '$(chevron-down) Show All Skills',
+                        description: `View all ${skillsWithData.length} skills`
+                    });
+                }
+                
+                // Add actions separator and actions at the bottom (in requested order)
+                items.push({
+                    label: 'Actions',
+                    kind: vscode.QuickPickItemKind.Separator
+                });
+                
+                items.push({
+                    label: '$(cloud-upload) Send Digest',
+                    description: 'Send your coding activity digest now'
+                });
+                
+                items.push({
+                    label: '$(globe) Open Frolic Dashboard',
+                    description: 'View full dashboard in browser'
+                });
+                
+                items.push({
+                    label: '$(refresh) Refresh Skills',
+                    description: 'Update skills data'
+                });
+                
+                items.push({
+                    label: '$(sign-out) Sign Out',
+                    description: 'Sign out of Frolic'
+                });
+                
+                // Update quick pick
+                quickPick.busy = false;
+                quickPick.placeholder = showAll ? 'All skills • Select an action below' : 'Top 3 skills • Select an action below';
+                quickPick.items = items;
+            };
+            
+            // Initial render with top 3 skills
+            renderSkills(skillsData, showAllSkills);
+            
+            // Handle selection
+            quickPick.onDidAccept(() => {
+                const selection = quickPick.selectedItems[0];
+                if (selection?.label.includes('Show All Skills')) {
+                    showAllSkills = true;
+                    renderSkills(skillsData, showAllSkills);
+                } else if (selection?.label.includes('Refresh')) {
+                    quickPick.dispose();
+                    vscode.commands.executeCommand('frolic.openSkills');
+                } else if (selection?.label.includes('Send Digest')) {
+                    quickPick.dispose();
+                    vscode.commands.executeCommand('frolic.sendDigest');
+                } else if (selection?.label.includes('Sign Out')) {
+                    quickPick.dispose();
+                    vscode.commands.executeCommand('frolic.signOut');
+                } else if (selection?.label.includes('Open Frolic Dashboard')) {
+                    vscode.env.openExternal(vscode.Uri.parse(`${getApiBaseUrl()}/skills`));
+                    quickPick.dispose();
+                }
+            });
+            
+        } catch (error: any) {
+            console.error('[FROLIC] Skills fetch error details:', {
+                message: error.message,
+                stack: error.stack
+            });
+            quickPick.busy = false;
+            quickPick.items = [{
+                label: '$(error) Failed to load skills',
+                description: 'Please try again',
+                detail: error.message
+            }];
+        }
+    } catch (error) {
+        console.error('[FROLIC] Error opening skills view:', error);
+        vscode.window.showErrorMessage('Failed to open skills view. Please try again.');
+    }
+});
+    context.subscriptions.push(openSkillsCmd);
+
+    // Test command to debug API endpoint
+    const testSkillsApiCmd = vscode.commands.registerCommand('frolic.testSkillsApi', async () => {
+        const apiBaseUrl = getApiBaseUrl();
+        const accessToken = await getValidAccessToken(context);
+        
+        console.log('[FROLIC TEST] Base URL:', apiBaseUrl);
+        console.log('[FROLIC TEST] Has token:', !!accessToken);
+        
+        if (!accessToken) {
+            vscode.window.showErrorMessage('No access token available');
+            return;
+        }
+        
+        // Test the exact endpoint
+        try {
+            console.log('[FROLIC TEST] Testing endpoint:', `${apiBaseUrl}/api/skills`);
+            const response = await fetchWithTimeout(`${apiBaseUrl}/api/skills`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
+                }
+            }, 30000);
+            
+            console.log('[FROLIC TEST] Response status:', response.status);
+            console.log('[FROLIC TEST] Response headers:', Object.fromEntries(response.headers.entries()));
+            
+            const text = await response.text();
+            console.log('[FROLIC TEST] Response body:', text);
+            
+            if (response.ok) {
+                try {
+                    const data = JSON.parse(text);
+                    vscode.window.showInformationMessage(`Skills API works! Found ${data.data?.length || 0} skills`);
+                } catch (e) {
+                    vscode.window.showErrorMessage('Skills API returned invalid JSON');
+                }
+            } else {
+                vscode.window.showErrorMessage(`Skills API error: ${response.status} - ${text}`);
+            }
+        } catch (error: any) {
+            console.error('[FROLIC TEST] Error:', error);
+            vscode.window.showErrorMessage(`Test failed: ${error.message}`);
+        }
+    });
+    context.subscriptions.push(testSkillsApiCmd);
+
     // Register debug command for troubleshooting (can be triggered from status bar)
     const debugCmd = vscode.commands.registerCommand('frolic.debug', async () => {
         const accessToken = await getValidAccessToken(context);
@@ -3201,9 +3460,9 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'authenticated':
             statusBarItem.text = '$(check) Frolic Connected';
-            statusBarItem.tooltip = `Frolic: Connected and tracking activity (${LOG_BUFFER.length} events logged). Click to view status.`;
+            statusBarItem.tooltip = `Frolic: Connected and tracking activity (${LOG_BUFFER.length} events logged). Click to view skills.`;
             statusBarItem.backgroundColor = undefined;
-            statusBarItem.command = 'frolic.showDropdown';
+            statusBarItem.command = 'frolic.openSkills';
             break;
         case 'unauthenticated':
             statusBarItem.text = '$(sign-in) Connect Frolic';
@@ -3262,7 +3521,11 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
                 `Frolic Session • ${sessionDuration}m`,
                 vscode.TreeItemCollapsibleState.None,
                 'session-header',
-                undefined,
+                {
+                    command: 'frolic.openSkills',
+                    title: 'View Skills',
+                    tooltip: 'Click to view your skills dashboard'
+                },
                 logoPath
             ));
 
@@ -3614,6 +3877,9 @@ class FrolicTreeItem extends vscode.TreeItem {
         if (iconPath) {
             this.iconPath = iconPath;
         }
+        if (command) {
+            this.command = command;
+        }
     }
 }
 
@@ -3817,6 +4083,103 @@ export async function sendDigestToBackend(
       console.error('[FROLIC] Unexpected error sending digest:', err);
       throw new Error('UNKNOWN_ERROR');
     }
+  }
+}
+
+/**
+ * Create a text-based progress bar
+ */
+function createProgressBar(percentage: number): string {
+    // Ensure percentage is between 0 and 100
+    const safePercentage = Math.max(0, Math.min(100, percentage));
+    const filled = Math.round(safePercentage / 10);
+    const empty = 10 - filled;
+    return '█'.repeat(filled) + '░'.repeat(empty);
+}
+
+/**
+ * Fetch skills data from the API
+ */
+async function fetchSkillsData(context: vscode.ExtensionContext): Promise<any[]> {
+  const apiBaseUrl = getApiBaseUrl();
+  console.log('[FROLIC] Skills API base URL:', apiBaseUrl);
+  
+  const accessToken = await getValidAccessToken(context);
+  
+  if (!accessToken) {
+    console.error('[FROLIC] No access token available for skills fetch');
+    throw new Error('Not authenticated');
+  }
+  
+  console.log('[FROLIC] Fetching from:', `${apiBaseUrl}/api/skills`);
+  
+  try {
+    const response = await fetchWithTimeout(`${apiBaseUrl}/api/skills`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
+      }
+    }, 30000);
+    
+    console.log('[FROLIC] Skills API response status:', response.status);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[FROLIC] Skills API error response:', response.status, errorText);
+      
+      if (response.status === 401 || response.status === 403) {
+        // Try to refresh token
+        console.log('[FROLIC] Auth error on skills endpoint, attempting token refresh...');
+        const refreshToken = await context.secrets.get('frolic.refreshToken');
+        if (refreshToken) {
+          const newToken = await performTokenRefresh(context, refreshToken);
+          if (newToken) {
+            console.log('[FROLIC] Token refreshed successfully, retrying skills fetch...');
+            // Retry with new token
+            const retryResponse = await fetchWithTimeout(`${apiBaseUrl}/api/skills`, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${newToken}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
+              }
+            }, 30000);
+            
+            console.log('[FROLIC] Retry response status:', retryResponse.status);
+            
+            if (retryResponse.ok) {
+              const data = await retryResponse.json();
+              console.log('[FROLIC] Skills data after retry:', data);
+              return data.data || [];
+            } else {
+              const retryError = await retryResponse.text();
+              console.error('[FROLIC] Skills retry failed:', retryResponse.status, retryError);
+              throw new Error(`Skills API error after retry: ${retryResponse.status} - ${retryError}`);
+            }
+          } else {
+            console.error('[FROLIC] Token refresh returned null');
+          }
+        } else {
+          console.error('[FROLIC] No refresh token available');
+        }
+        throw new Error(`Authentication failed: ${response.status} - ${errorText}`);
+      }
+      throw new Error(`Failed to fetch skills: ${response.status} - ${errorText}`);
+    }
+    
+    const data = await response.json();
+    console.log('[FROLIC] Skills API success, data structure:', {
+      success: data.success,
+      dataLength: data.data?.length,
+      firstSkill: data.data?.[0]
+    });
+    return data.data || [];
+  } catch (error: any) {
+    console.error('[FROLIC] Error fetching skills:', error.message || error);
+    console.error('[FROLIC] Full error:', error);
+    throw error;
   }
 }
 
