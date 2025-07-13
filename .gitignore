@@ -120,3 +120,10 @@ scripts/test-notification-throttling.js
 scripts/test-session-detection.js
 scripts/test-session-recovery.js
 scripts/test-smart-backup-system.js
+scripts/create-*-test-*.ts
+test-*.js
+test_*.js
+
+# Development documentation
+ISSUE_SUMMARY.md
+fix-*.md
