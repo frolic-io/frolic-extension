@@ -1737,7 +1737,7 @@ function analyzeLogs(logs: any[]): any {
     for (const change of entry.changes || []) {
       const changeText = change.changeText || '';
       
-      totalLinesAdded += change.lineCountDelta || 0;
+      totalLinesAdded += Math.max(0, change.lineCountDelta || 0); // Only count additions, not deletions
       fileActivity[filePath].linesChanged += Math.abs(change.lineCountDelta || 0);
       
       if (change.likelyAI) aiInsertions++;
@@ -2443,11 +2443,22 @@ export async function activate(context: vscode.ExtensionContext) {
                 selectionLength: editor && editor.selection && editor.selection.end && editor.selection.start
                   ? editor.selection.end.character - editor.selection.start.character
                   : 0,
-                changes: event.contentChanges.map(change => ({
-                    text: change.text,
-                    textLength: change.text.length,
-                    rangeLength: change.rangeLength
-                }))
+                changes: event.contentChanges.map(change => {
+                    // Simple, reliable line count calculation
+                    const lineCountDelta = (change.text.match(/\n/g) || []).length;
+                    
+                    // Simple AI detection
+                    const likelyAI = change.text.length > 100 && change.rangeLength === 0;
+                    
+                    return {
+                        text: change.text,
+                        changeText: change.text, // Add this field for analyzeLogs
+                        textLength: change.text.length,
+                        rangeLength: change.rangeLength,
+                        lineCountDelta: lineCountDelta,
+                        likelyAI: likelyAI
+                    };
+                })
             });
         })
     );
@@ -3387,9 +3398,9 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 sessionId = crypto.randomUUID();
                 lastDigestSentTime = Date.now(); // Record when we sent this digest
                 
-                // Reset session timer in activity panel
+                // Update last digest time (but don't reset session timer - keep tracking session duration)
                 if (activityProvider) {
-                    activityProvider.resetSessionTimer();
+                    activityProvider.updateLastDigestTime();
                 }
                 
                 console.log(`[FROLIC] Digest sent successfully. New session: ${sessionId}`);
@@ -3490,10 +3501,27 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
 class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<FrolicTreeItem | undefined | null | void> = new vscode.EventEmitter<FrolicTreeItem | undefined | null | void>();
     readonly onDidChangeTreeData: vscode.Event<FrolicTreeItem | undefined | null | void> = this._onDidChangeTreeData.event;
-    private sessionStartTime: Date;
+    private sessionStartTime: Date = new Date();
+    private lastDigestTime: number = 0;
     
     constructor(private context: vscode.ExtensionContext) {
+        // Initialize with current time first
         this.sessionStartTime = new Date();
+        
+        // Try to restore session start time from storage
+        const storedSessionTime = this.context.globalState.get<number>('frolic.sessionStartTime');
+        if (storedSessionTime) {
+            this.sessionStartTime = new Date(storedSessionTime);
+        } else {
+            // No stored time, save current time
+            this.context.globalState.update('frolic.sessionStartTime', this.sessionStartTime.getTime());
+        }
+        
+        // Try to restore last digest time from storage
+        const storedDigestTime = this.context.globalState.get<number>('frolic.lastDigestTime');
+        if (storedDigestTime) {
+            this.lastDigestTime = storedDigestTime;
+        }
     }
 
     refresh(): void {
@@ -3502,6 +3530,8 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
 
     resetSessionTimer(): void {
         this.sessionStartTime = new Date();
+        // Persist the new session start time
+        this.context.globalState.update('frolic.sessionStartTime', this.sessionStartTime.getTime());
         this.refresh(); // Update the display
     }
 
@@ -3536,8 +3566,9 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
             }
 
             // Last digest status (always visible)
+            const lastDigestText = this.getLastDigestTimeText();
             items.push(new FrolicTreeItem(
-                'Last digest: just now',
+                lastDigestText,
                 vscode.TreeItemCollapsibleState.None,
                 'digest-status',
                 undefined,
@@ -3767,6 +3798,35 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
         return LOG_BUFFER
             .filter(e => e.eventType === 'file_edit')
             .reduce((sum, e) => sum + (e.changes?.filter((c: any) => c.likelyAI).length || 0), 0);
+    }
+
+    private getLastDigestTimeText(): string {
+        if (this.lastDigestTime === 0) {
+            return 'Last digest: never';
+        }
+        
+        const now = Date.now();
+        const diffMs = now - this.lastDigestTime;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMs / 3600000);
+        const diffDays = Math.floor(diffMs / 86400000);
+        
+        if (diffDays > 0) {
+            return `Last digest: ${diffDays}d ago`;
+        } else if (diffHours > 0) {
+            return `Last digest: ${diffHours}h ago`;
+        } else if (diffMins > 0) {
+            return `Last digest: ${diffMins}m ago`;
+        } else {
+            return 'Last digest: just now';
+        }
+    }
+
+    updateLastDigestTime(): void {
+        this.lastDigestTime = Date.now();
+        // Persist to storage
+        this.context.globalState.update('frolic.lastDigestTime', this.lastDigestTime);
+        this.refresh();
     }
 
     private generateInsights(): string[] {

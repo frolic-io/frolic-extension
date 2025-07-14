@@ -5,6 +5,27 @@ All notable changes to the Frolic extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] - 2025-01-14
+
+### Fixed
+- Activity panel now shows accurate "Last digest" time instead of always showing "just now"
+- Session timer no longer resets to 0m after sending digests (maintains session duration)
+- Fixed totalLinesAdded calculation to only count line additions, not deletions
+- Session timer and last digest time now persist across VS Code restarts
+- **Critical Fix**: Code changes were not being captured in digests (showing 0 lines added)
+- Fixed missing `changeText` and `lineCountDelta` fields that prevented proper change tracking
+- Now properly calculates line additions/deletions for each edit
+- AI detection now works correctly for large code insertions
+
+### Improved
+- Better state management for activity panel display
+- More accurate tracking of coding session metrics
+
+### Technical Details
+- Added proper mapping of VS Code's `contentChanges` to include all required fields for digest analysis
+- Fixed field name mismatch (`text` vs `changeText`) that caused empty code samples
+- Added line count delta calculation based on actual text changes
+
 ## [1.1.4] - 2025-01-12
 
 ### Added
