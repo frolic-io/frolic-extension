@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {
@@ -59,7 +59,8 @@
     "onCommand:frolic.flushLogs",
     "onCommand:frolic.sendDigest",
     "onCommand:frolic.showWelcome",
-    "onCommand:frolic.openSkills"
+    "onCommand:frolic.openSkills",
+    "onCommand:frolic.showDropdown"
   ],
   "contributes": {
     "commands": [
@@ -86,6 +87,10 @@
       {
         "command": "frolic.openSkills",
         "title": "Frolic: View Skills Dashboard"
+      },
+      {
+        "command": "frolic.showDropdown",
+        "title": "Frolic: Show Status & Actions"
       }
     ],
     "configuration": {

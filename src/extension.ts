@@ -3466,9 +3466,9 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             break;
         case 'unauthenticated':
             statusBarItem.text = '$(sign-in) Connect Frolic';
-            statusBarItem.tooltip = 'Frolic: Click to view status and connect';
+            statusBarItem.tooltip = 'Frolic: Click to sign in';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-            statusBarItem.command = 'frolic.showDropdown';
+            statusBarItem.command = 'frolic.signIn';
             break;
         case 'sending':
             statusBarItem.text = '$(cloud-upload) Frolic';
