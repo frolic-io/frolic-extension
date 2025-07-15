@@ -44,6 +44,8 @@ const QUICK_FIX_THRESHOLD = 5; // Backup after 5 events if 2+ minutes since last
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
 const TOKEN_REFRESH_CHECK_INTERVAL = 5 * 60 * 1000; // Check every 5 minutes for more aggressive refresh
 
+// 📊 External Edit Tracking - Track file line counts for external edits (e.g., Claude)
+const fileLineBaseline = new Map<string, number>();
 
 // 🔄 PHASE 2.2: Learning Struggle Detection - Global state
 let userActionHistory: Array<{
@@ -367,6 +369,8 @@ function logEvent(eventType: string, data: any) {
     }
     
     const filePath = sanitizePath(rawFilePath);
+    
+    // Use minimal filtering like stable version
     if (filePath.includes(".git") || filePath.startsWith("git/") || filePath === "exthost") return;
 
     // Apply privacy mode if enabled
@@ -1683,6 +1687,8 @@ function analyzeLogs(logs: any[]): any {
     firstEdit: string; 
     lastEdit: string;
     editPattern: number[]; // Time intervals between edits
+    externalEdits?: number; // Edits made outside VS Code (e.g., Claude)
+    externalLinesAdded?: number; // Lines added by external tools
   }> = {};
 
   // Session timing
@@ -1705,6 +1711,11 @@ function analyzeLogs(logs: any[]): any {
     const filePath = entry.relativePath;
     files.add(filePath);
     langCounts[entry.language] = (langCounts[entry.language] || 0) + 1;
+    
+    // Check if entry has pre-calculated totals (newer format)
+    if (entry.totalLinesAdded > 0) {
+      totalLinesAdded += entry.totalLinesAdded;
+    }
 
     // File extension tracking
     const ext = filePath.split('.').pop()?.toLowerCase() || 'unknown';
@@ -1721,11 +1732,19 @@ function analyzeLogs(logs: any[]): any {
         linesChanged: 0, 
         firstEdit: entry.timestamp,
         lastEdit: entry.timestamp,
-        editPattern: []
+        editPattern: [],
+        externalEdits: 0,
+        externalLinesAdded: 0
       };
     }
     fileActivity[filePath].edits++;
     fileActivity[filePath].lastEdit = entry.timestamp;
+    
+    // Track external edits separately
+    if (entry.externalEdit || entry.saveTriggered) {
+      fileActivity[filePath].externalEdits = (fileActivity[filePath].externalEdits || 0) + 1;
+      fileActivity[filePath].externalLinesAdded = (fileActivity[filePath].externalLinesAdded || 0) + (entry.totalLinesAdded || 0);
+    }
 
     // Calculate edit intervals for pattern analysis
     if (i > 0 && logs[i-1].relativePath === filePath) {
@@ -1735,10 +1754,19 @@ function analyzeLogs(logs: any[]): any {
 
     // Process code changes - collect raw data
     for (const change of entry.changes || []) {
-      const changeText = change.changeText || '';
+      const changeText = change.text || ''; // Use change.text from the event structure
       
-      totalLinesAdded += Math.max(0, change.lineCountDelta || 0); // Only count additions, not deletions
-      fileActivity[filePath].linesChanged += Math.abs(change.lineCountDelta || 0);
+      // Use pre-calculated lineCountDelta if available, otherwise calculate
+      let lineCountDelta = 0;
+      if (change.lineCountDelta !== undefined) {
+        lineCountDelta = change.lineCountDelta;
+      } else {
+        // Fallback calculation: count newlines in added text
+        lineCountDelta = changeText.length > 0 ? (changeText.match(/\n/g) || []).length : 0;
+      }
+      
+      totalLinesAdded += Math.max(0, lineCountDelta); // Count net additions
+      fileActivity[filePath].linesChanged += Math.max(0, lineCountDelta);
       
       if (change.likelyAI) aiInsertions++;
 
@@ -1749,8 +1777,8 @@ function analyzeLogs(logs: any[]): any {
           language: entry.language,
           timestamp: entry.timestamp,
           change: changeText.substring(0, 500), // Limit size but keep raw
-          size: change.textLength,
-          type: change.textLength > change.rangeLength ? 'addition' : 'modification',
+          size: change.textLength || changeText.length,
+          type: (change.textLength || changeText.length) > change.rangeLength ? 'addition' : 'modification',
           // 🔄 PHASE 2.1: Enhanced AI collaboration detection
           aiCollaborationSignals: detectAICollaborationPatterns(changeText, change)
         });
@@ -2421,17 +2449,27 @@ export async function activate(context: vscode.ExtensionContext) {
     // Track file edits
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument((event) => {
-            // Skip if no actual content changes (e.g., cursor movements)
-            if (event.contentChanges.length === 0) {
-                return;
-            }
-            
-            // Debug logging to verify changes are being captured
-            const totalChangeLength = event.contentChanges.reduce((sum, change) => sum + change.text.length, 0);
-            console.log(`[FROLIC] Capturing ${event.contentChanges.length} changes (${totalChangeLength} chars) in ${event.document.fileName}`);
-            
             const editor = vscode.window.activeTextEditor;
             const doc = event.document;
+
+            // Calculate line changes from contentChanges
+            let totalLineChanges = 0;
+            let totalTextAdded = 0;
+            
+            for (const change of event.contentChanges) {
+                // Count lines added (newlines in inserted text)
+                const linesAdded = change.text ? (change.text.match(/\n/g) || []).length : 0;
+                
+                // Count lines removed (estimate from range)
+                const linesRemoved = change.range ? change.range.end.line - change.range.start.line : 0;
+                
+                // Net line change for this edit
+                const netLineChange = linesAdded - linesRemoved;
+                totalLineChanges += Math.max(0, netLineChange); // Only count net additions
+                
+                // Track total text length added
+                totalTextAdded += change.text ? change.text.length : 0;
+            }
 
             logEvent('file_edit', {
                 file: doc.fileName,
@@ -2443,22 +2481,17 @@ export async function activate(context: vscode.ExtensionContext) {
                 selectionLength: editor && editor.selection && editor.selection.end && editor.selection.start
                   ? editor.selection.end.character - editor.selection.start.character
                   : 0,
-                changes: event.contentChanges.map(change => {
-                    // Simple, reliable line count calculation
-                    const lineCountDelta = (change.text.match(/\n/g) || []).length;
-                    
-                    // Simple AI detection
-                    const likelyAI = change.text.length > 100 && change.rangeLength === 0;
-                    
-                    return {
-                        text: change.text,
-                        changeText: change.text, // Add this field for analyzeLogs
-                        textLength: change.text.length,
-                        rangeLength: change.rangeLength,
-                        lineCountDelta: lineCountDelta,
-                        likelyAI: likelyAI
-                    };
-                })
+                // Store both individual changes and calculated totals
+                changes: event.contentChanges.map(change => ({
+                    text: change.text,
+                    textLength: change.text.length,
+                    rangeLength: change.rangeLength,
+                    // Add calculated line delta for this specific change
+                    lineCountDelta: change.text ? (change.text.match(/\n/g) || []).length : 0
+                })),
+                // Add totals for easier processing in analyzeLogs
+                totalLinesAdded: totalLineChanges,
+                totalTextAdded: totalTextAdded
             });
         })
     );
@@ -2480,6 +2513,53 @@ export async function activate(context: vscode.ExtensionContext) {
             if (doc.fileName && !doc.fileName.includes('.git')) {
                 detectFrequentFileSwitching(doc.fileName, timestamp);
             }
+            
+            // Initialize baseline for opened files
+            if (!doc.isUntitled && doc.fileName) {
+                fileLineBaseline.set(doc.fileName, doc.lineCount);
+            }
+        })
+    );
+
+    // 📊 Track file saves to capture external edits (e.g., Claude)
+    context.subscriptions.push(
+        vscode.workspace.onDidSaveTextDocument((document) => {
+            const filePath = document.fileName;
+            const currentLines = document.lineCount;
+            const previousLines = fileLineBaseline.get(filePath) || 0;
+            
+            // Calculate lines added (positive changes only)
+            const linesAdded = Math.max(0, currentLines - previousLines);
+            
+            // Check if this was an external edit (document wasn't dirty before save)
+            // External edits won't have the dirty flag set
+            const isExternalEdit = linesAdded > 0 && !document.isDirty;
+            
+            if (linesAdded > 0) {
+                logEvent('file_edit', {
+                    file: filePath,
+                    language: document.languageId,
+                    lineCount: currentLines,
+                    isUntitled: false,
+                    isDirty: false,
+                    cursorPosition: null,
+                    selectionLength: 0,
+                    changes: [{
+                        text: '', // We don't have the actual text for external changes
+                        textLength: 0,
+                        rangeLength: 0,
+                        lineCountDelta: linesAdded
+                    }],
+                    // Add tracking for external edits
+                    totalLinesAdded: linesAdded,
+                    totalTextAdded: 0,
+                    externalEdit: isExternalEdit,
+                    saveTriggered: true
+                });
+            }
+            
+            // Update baseline for next comparison
+            fileLineBaseline.set(filePath, currentLines);
         })
     );
 
@@ -2846,10 +2926,11 @@ export async function activate(context: vscode.ExtensionContext) {
                         const pointsToNext = skillData.points_to_next_level || 10;
                         
                         // Calculate progress within current level (not overall)
-                        // This matches how the web app calculates progress
-                        const pointsInCurrentLevel = totalPoints - (totalPoints - pointsToNext);
-                        const pointsNeededForLevel = currentLevel === 1 ? 10 : pointsToNext + pointsInCurrentLevel;
-                        const progress = pointsNeededForLevel > 0 ? Math.round((pointsInCurrentLevel / pointsNeededForLevel) * 100) : 0;
+                        // Level requirements: [10, 12, 15, 18, 20, 25, 30, 35, 40, 50]
+                        const levelRequirements = [10, 12, 15, 18, 20, 25, 30, 35, 40, 50];
+                        const currentLevelReq = levelRequirements[currentLevel - 1] || 10;
+                        const pointsInCurrentLevel = currentLevelReq - pointsToNext;
+                        const progress = currentLevelReq > 0 ? Math.round((pointsInCurrentLevel / currentLevelReq) * 100) : 0;
                         const progressBar = createProgressBar(progress);
                         
                         items.push({
@@ -3212,6 +3293,14 @@ export async function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Initialize baseline for already open files
+    vscode.workspace.textDocuments.forEach(document => {
+        if (!document.isUntitled && document.fileName) {
+            fileLineBaseline.set(document.fileName, document.lineCount);
+            console.log(`[FROLIC] Initialized baseline for ${document.fileName}: ${document.lineCount} lines`);
+        }
+    });
+
     console.log(`✅ Frolic Logger is now active! (${LOG_BUFFER.length} events in buffer)`);
 }
 
@@ -3398,8 +3487,9 @@ async function sendDigestImmediately(context: vscode.ExtensionContext, maxRetrie
                 sessionId = crypto.randomUUID();
                 lastDigestSentTime = Date.now(); // Record when we sent this digest
                 
-                // Update last digest time (but don't reset session timer - keep tracking session duration)
+                // Reset session timer after successful digest send
                 if (activityProvider) {
+                    activityProvider.resetSessionTimer();
                     activityProvider.updateLastDigestTime();
                 }
                 
@@ -3971,7 +4061,14 @@ export async function sendDigestToBackend(
   // 🔧 FIX: Add JSON serialization safety check to prevent circular reference errors
   let serializedBody: string;
   try {
-    serializedBody = JSON.stringify({ sessionId, digest });
+    // Remove fields that backend doesn't expect
+    const cleanDigest = { ...digest };
+    if (cleanDigest.rawData) {
+      delete cleanDigest.rawData.struggleIndicators;
+      delete cleanDigest.rawData.errorTrackingData;
+      delete cleanDigest.rawData.projectStructure;
+    }
+    serializedBody = JSON.stringify({ sessionId, digest: cleanDigest });
   } catch (jsonError) {
     console.error('[FROLIC] JSON serialization failed - circular reference detected:', jsonError);
     throw new Error(`JSON_SERIALIZATION_ERROR: ${jsonError instanceof Error ? jsonError.message : 'Unknown error'}`);
