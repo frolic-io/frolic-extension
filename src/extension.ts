@@ -1754,7 +1754,7 @@ function analyzeLogs(logs: any[]): any {
 
     // Process code changes - collect raw data
     for (const change of entry.changes || []) {
-      const changeText = change.text || ''; // Use change.text from the event structure
+      const changeText = change.changeText || ''; // Use change.changeText from the logged structure
       
       // Use pre-calculated lineCountDelta if available, otherwise calculate
       let lineCountDelta = 0;
