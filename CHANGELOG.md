@@ -5,6 +5,27 @@ All notable changes to the Frolic extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2025-07-16
+
+### Fixed
+- **Critical Fix**: Line counting now calculates NET changes (additions minus deletions) instead of counting all newlines
+- Fixed inflated line counts that occurred when saving files or from file rewrites
+- Added detection for file rewrites to prevent counting them as user-added lines
+- `.frolic-session.json` backup file is now excluded from activity tracking
+- External edits (e.g., from AI tools) are now properly tracked when saved in VS Code
+
+### Improved
+- More accurate "lines added" metrics in daily digests
+- Better quality code samples in digests (no duplicate content from saves)
+- Enhanced quiz generation based on actual code written, not file operations
+- More relevant technology detection from real coding activity
+
+### Technical Details
+- Implemented proper line range calculation for multi-line edits
+- Added file rewrite detection for operations that replace entire file contents
+- Updated filtering to exclude internal extension files from tracking
+- Line counting now properly handles: additions, deletions, replacements, and file rewrites
+
 ## [1.1.7] - 2025-01-14
 
 ### Fixed

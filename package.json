@@ -1,7 +1,7 @@
 {
   "name": "frolic",
   "displayName": "Frolic",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "Frolic - Personalized coding activity tracker and insights. Get automated recaps of your development sessions via email newsletter.",
   "main": "./out/extension.js",
   "scripts": {

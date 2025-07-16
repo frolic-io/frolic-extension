@@ -371,7 +371,8 @@ function logEvent(eventType: string, data: any) {
     const filePath = sanitizePath(rawFilePath);
     
     // Use minimal filtering like stable version
-    if (filePath.includes(".git") || filePath.startsWith("git/") || filePath === "exthost") return;
+    if (filePath.includes(".git") || filePath.startsWith("git/") || filePath === "exthost" || 
+        filePath.includes(".frolic-session.json") || filePath.includes(".frolic-log.json")) return;
 
     // Apply privacy mode if enabled
     const privacyPath = getPrivacyModePath(filePath);
@@ -2455,17 +2456,44 @@ export async function activate(context: vscode.ExtensionContext) {
             // Calculate line changes from contentChanges
             let totalLineChanges = 0;
             let totalTextAdded = 0;
+            let isLikelyFileRewrite = false;
+            
+            // Detect if this is likely a file rewrite (e.g., save operation that replaces entire content)
+            if (event.contentChanges.length === 1) {
+                const change = event.contentChanges[0];
+                // If the range covers the entire document and text is large, it's likely a rewrite
+                if (change.range && 
+                    change.range.start.line === 0 && 
+                    change.range.start.character === 0 &&
+                    change.rangeLength > 1000 && 
+                    change.text.length > 1000) {
+                    isLikelyFileRewrite = true;
+                }
+            }
             
             for (const change of event.contentChanges) {
-                // Count lines added (newlines in inserted text)
-                const linesAdded = change.text ? (change.text.match(/\n/g) || []).length : 0;
+                // Count lines in the new text
+                const linesInNewText = change.text ? (change.text.match(/\n/g) || []).length : 0;
                 
-                // Count lines removed (estimate from range)
-                const linesRemoved = change.range ? change.range.end.line - change.range.start.line : 0;
+                // Count lines in the replaced range
+                let linesInOldRange = 0;
+                if (change.range && !change.range.isEmpty) {
+                    // Calculate lines that were replaced
+                    linesInOldRange = change.range.end.line - change.range.start.line;
+                    // Only add 1 if we're not at the start of the end line
+                    if (change.range.end.character > 0) {
+                        linesInOldRange++;
+                    }
+                }
                 
-                // Net line change for this edit
-                const netLineChange = linesAdded - linesRemoved;
-                totalLineChanges += Math.max(0, netLineChange); // Only count net additions
+                // Calculate NET line change (can be negative)
+                const netLineChange = linesInNewText - linesInOldRange;
+                
+                // For file rewrites, don't count as user-added lines
+                if (!isLikelyFileRewrite) {
+                    // Only count positive changes (lines added)
+                    totalLineChanges += Math.max(0, netLineChange);
+                }
                 
                 // Track total text length added
                 totalTextAdded += change.text ? change.text.length : 0;
@@ -2482,16 +2510,32 @@ export async function activate(context: vscode.ExtensionContext) {
                   ? editor.selection.end.character - editor.selection.start.character
                   : 0,
                 // Store both individual changes and calculated totals
-                changes: event.contentChanges.map(change => ({
-                    text: change.text,
-                    textLength: change.text.length,
-                    rangeLength: change.rangeLength,
-                    // Add calculated line delta for this specific change
-                    lineCountDelta: change.text ? (change.text.match(/\n/g) || []).length : 0
-                })),
+                changes: event.contentChanges.map(change => {
+                    // Calculate NET line change for this specific change
+                    const linesInNewText = change.text ? (change.text.match(/\n/g) || []).length : 0;
+                    let linesInOldRange = 0;
+                    if (change.range && !change.range.isEmpty) {
+                        linesInOldRange = change.range.end.line - change.range.start.line;
+                        if (change.range.end.character > 0) {
+                            linesInOldRange++;
+                        }
+                    }
+                    const netLineChange = linesInNewText - linesInOldRange;
+                    
+                    return {
+                        text: change.text,
+                        textLength: change.text.length,
+                        rangeLength: change.rangeLength,
+                        // Store NET line change, not just lines in new text
+                        lineCountDelta: isLikelyFileRewrite ? 0 : Math.max(0, netLineChange),
+                        rangeStart: change.range ? change.range.start : null,
+                        rangeEnd: change.range ? change.range.end : null
+                    };
+                }),
                 // Add totals for easier processing in analyzeLogs
                 totalLinesAdded: totalLineChanges,
-                totalTextAdded: totalTextAdded
+                totalTextAdded: totalTextAdded,
+                isFileRewrite: isLikelyFileRewrite
             });
         })
     );
