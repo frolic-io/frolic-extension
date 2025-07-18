@@ -5,6 +5,32 @@ All notable changes to the Frolic extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2025-07-17
+
+### Fixed
+- **Critical Fix**: Authentication tokens now properly track actual expiration times (~1 hour) instead of incorrectly assuming 365 days
+- Fixed intermittent logout issues caused by expired tokens not being refreshed
+- Users returning after lunch breaks or weekends will now have tokens automatically refreshed
+
+### Added
+- Background token refresh mechanism that checks every 5 minutes
+- Proactive token refresh 5 minutes before expiry
+- Health check integration to verify authentication status
+- Token expiration tracking and storage
+- Enhanced logging for authentication debugging
+
+### Improved
+- Better handling of expired tokens when VSCode starts up
+- Automatic token refresh using long-lived refresh tokens
+- More informative authentication status messages
+- Seamless re-authentication without user intervention
+
+### Technical Details
+- Added `startBackgroundTokenRefresh` and `stopBackgroundTokenRefresh` functions
+- Implemented token expiration storage in VSCode global state
+- Added `/api/auth/vscode/health` endpoint for lightweight auth verification
+- Fixed token expiration reporting in `/api/auth/vscode/token` and `/api/auth/vscode/refresh` endpoints
+
 ## [1.2.3] - 2025-07-16
 
 ### Fixed

@@ -43,6 +43,10 @@ const QUICK_FIX_THRESHOLD = 5; // Backup after 5 events if 2+ minutes since last
 // 🔄 ENHANCED: Background token refresh management
 let backgroundTokenRefreshTimer: NodeJS.Timeout | null = null;
 const TOKEN_REFRESH_CHECK_INTERVAL = 5 * 60 * 1000; // Check every 5 minutes for more aggressive refresh
+const TOKEN_REFRESH_BUFFER = 5 * 60; // Refresh 5 minutes before expiry (in seconds)
+let tokenExpiresAt: number | null = null; // Store token expiration timestamp
+let lastHealthCheck: number = 0; // Track last health check time
+const HEALTH_CHECK_INTERVAL = 10 * 60 * 1000; // Check health every 10 minutes
 
 // 📊 External Edit Tracking - Track file line counts for external edits (e.g., Claude)
 const fileLineBaseline = new Map<string, number>();
@@ -1107,11 +1111,25 @@ async function getValidAccessToken(context: vscode.ExtensionContext): Promise<st
   
   // Check if access token is expired by trying to decode it
   if (isTokenExpired(accessToken)) {
+    console.log('[FROLIC] Access token is expired, attempting refresh...');
     if (refreshToken) {
+      console.log('[FROLIC] Refresh token available, refreshing access token...');
       return await performTokenRefresh(context, refreshToken);
     } else {
+      console.log('[FROLIC] No refresh token available, user needs to sign in again');
       await context.secrets.delete('frolic.accessToken');
       return null;
+    }
+  }
+  
+  // Check if we should proactively refresh (5 minutes before expiry)
+  if (tokenExpiresAt && refreshToken) {
+    const now = Math.floor(Date.now() / 1000);
+    const timeUntilExpiry = tokenExpiresAt - now;
+    
+    if (timeUntilExpiry < TOKEN_REFRESH_BUFFER) {
+      console.log(`[FROLIC] Token expiring in ${timeUntilExpiry}s, proactively refreshing...`);
+      return await performTokenRefresh(context, refreshToken);
     }
   }
   
@@ -1312,6 +1330,109 @@ async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<voi
   
   // Stop background token refresh when clearing tokens
   stopBackgroundTokenRefresh();
+  
+  // Clear stored expiration time
+  tokenExpiresAt = null;
+  await context.globalState.update('frolic.tokenExpiresAt', undefined);
+}
+
+/**
+ * Start background token refresh timer
+ */
+function startBackgroundTokenRefresh(context: vscode.ExtensionContext): void {
+  // Clear any existing timer
+  stopBackgroundTokenRefresh();
+  
+  console.log('[FROLIC] Starting background token refresh timer');
+  
+  // Set up periodic check
+  backgroundTokenRefreshTimer = setInterval(async () => {
+    try {
+      const accessToken = await context.secrets.get('frolic.accessToken');
+      const refreshToken = await context.secrets.get('frolic.refreshToken');
+      
+      if (!accessToken || !refreshToken) {
+        console.log('[FROLIC] Background refresh: no tokens available');
+        stopBackgroundTokenRefresh();
+        return;
+      }
+      
+      // Check if token is expired or about to expire
+      const now = Math.floor(Date.now() / 1000);
+      let shouldRefresh = false;
+      
+      // First check our stored expiration time
+      if (tokenExpiresAt) {
+        const timeUntilExpiry = tokenExpiresAt - now;
+        if (timeUntilExpiry < TOKEN_REFRESH_BUFFER) {
+          console.log(`[FROLIC] Background refresh: token expiring in ${timeUntilExpiry}s`);
+          shouldRefresh = true;
+        }
+      }
+      
+      // Also check by decoding the token
+      if (!shouldRefresh && isTokenExpired(accessToken)) {
+        console.log('[FROLIC] Background refresh: token is expired');
+        shouldRefresh = true;
+      }
+      
+      // Perform health check periodically
+      if (!shouldRefresh && (now - lastHealthCheck) > HEALTH_CHECK_INTERVAL / 1000) {
+        const isHealthy = await performHealthCheck(context, accessToken);
+        lastHealthCheck = now;
+        
+        if (!isHealthy) {
+          console.log('[FROLIC] Background refresh: health check failed, refreshing token');
+          shouldRefresh = true;
+        }
+      }
+      
+      if (shouldRefresh) {
+        console.log('[FROLIC] Background refresh: refreshing token...');
+        await performTokenRefresh(context, refreshToken);
+      }
+    } catch (err: any) {
+      console.error('[FROLIC] Background token refresh error:', err.message);
+    }
+  }, TOKEN_REFRESH_CHECK_INTERVAL);
+}
+
+/**
+ * Stop background token refresh timer
+ */
+function stopBackgroundTokenRefresh(): void {
+  if (backgroundTokenRefreshTimer) {
+    clearInterval(backgroundTokenRefreshTimer);
+    backgroundTokenRefreshTimer = null;
+    console.log('[FROLIC] Stopped background token refresh timer');
+  }
+}
+
+/**
+ * Perform a lightweight health check to verify token validity
+ */
+async function performHealthCheck(context: vscode.ExtensionContext, accessToken: string): Promise<boolean> {
+  try {
+    const apiBaseUrl = getApiBaseUrl();
+    const response = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/health`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
+      }
+    }, 5000); // 5 second timeout for health check
+    
+    if (!response.ok) {
+      console.log(`[FROLIC] Health check failed: ${response.status}`);
+      return false;
+    }
+    
+    const data = await response.json();
+    return data.authenticated === true;
+  } catch (err: any) {
+    console.log('[FROLIC] Health check error:', err.message);
+    return false; // Assume unhealthy on error
+  }
 }
 
 /**
@@ -1420,39 +1541,6 @@ async function performBackgroundTokenRefresh(context: vscode.ExtensionContext): 
 }
 
 /**
- * Start background token refresh timer
- */
-function startBackgroundTokenRefresh(context: vscode.ExtensionContext): void {
-  if (backgroundTokenRefreshTimer) {
-    clearInterval(backgroundTokenRefreshTimer);
-  }
-  
-  backgroundTokenRefreshTimer = setInterval(() => {
-    performBackgroundTokenRefresh(context).catch(() => {
-      // Silent error handling for background operations
-    });
-  }, TOKEN_REFRESH_CHECK_INTERVAL);
-  
-  // Also perform initial check after 5 minutes
-  setTimeout(() => {
-    performBackgroundTokenRefresh(context).catch(() => {
-      // Silent error handling for background operations
-    });
-  }, 5 * 60 * 1000);
-}
-
-/**
- * Stop background token refresh timer
- */
-function stopBackgroundTokenRefresh(): void {
-  if (backgroundTokenRefreshTimer) {
-    clearInterval(backgroundTokenRefreshTimer);
-    backgroundTokenRefreshTimer = null;
-  }
-}
-
-
-/**
  * Refresh the access token using the refresh token
  */
 async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken: string): Promise<string | null> {
@@ -1512,6 +1600,19 @@ async function refreshAccessToken(context: vscode.ExtensionContext, refreshToken
     await context.secrets.store('frolic.accessToken', newAccessToken);
     if (newRefreshToken) {
       await context.secrets.store('frolic.refreshToken', newRefreshToken);
+    }
+    
+    // Store token expiration time if provided
+    if (data.expires_at) {
+      tokenExpiresAt = Number(data.expires_at);
+      await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
+      console.log(`[FROLIC] Token expires at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
+    } else if (data.expires_in) {
+      // Calculate expiration from expires_in
+      const now = Math.floor(Date.now() / 1000);
+      tokenExpiresAt = now + Number(data.expires_in);
+      await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
+      console.log(`[FROLIC] Token expires in ${data.expires_in}s, at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
     }
     
     console.log('[FROLIC] Access token refreshed and validated successfully');
@@ -2242,6 +2343,19 @@ function analyzeLogs(logs: any[]): any {
         
         if (refreshToken) {
           await context.secrets.store('frolic.refreshToken', refreshToken);
+        }
+        
+        // Store token expiration time if provided
+        if (tokenData.expires_at) {
+          tokenExpiresAt = Number(tokenData.expires_at);
+          await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
+          console.log(`[FROLIC] Initial token expires at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
+        } else if (tokenData.expires_in) {
+          // Calculate expiration from expires_in
+          const now = Math.floor(Date.now() / 1000);
+          tokenExpiresAt = now + Number(tokenData.expires_in);
+          await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
+          console.log(`[FROLIC] Initial token expires in ${tokenData.expires_in}s, at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
         }
       
       // Clean up PKCE parameters
@@ -3310,11 +3424,20 @@ export async function activate(context: vscode.ExtensionContext) {
     // 🔄 ENHANCED: Start background token refresh if authenticated
     const hasTokens = await context.secrets.get('frolic.accessToken') && await context.secrets.get('frolic.refreshToken');
     if (hasTokens) {
+        // Load stored token expiration time
+        const storedExpiresAt = await context.globalState.get<number>('frolic.tokenExpiresAt');
+        if (storedExpiresAt) {
+            tokenExpiresAt = storedExpiresAt;
+            console.log(`[FROLIC] Loaded token expiration: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
+        }
+        
         startBackgroundTokenRefresh(context);
         
         // Proactively refresh token on activation to ensure fresh session
         const accessToken = await context.secrets.get('frolic.accessToken');
-        if (accessToken && shouldProactivelyRefreshToken(accessToken)) {
+        if (accessToken && isTokenExpired(accessToken)) {
+            console.log('[FROLIC] Token expired while VSCode was closed, will refresh on first use');
+        } else if (accessToken && shouldProactivelyRefreshToken(accessToken)) {
             console.log('[FROLIC] Proactively refreshing token on activation');
             performBackgroundTokenRefresh(context).catch(err => {
                 console.error('[FROLIC] Activation token refresh error:', err.message);
