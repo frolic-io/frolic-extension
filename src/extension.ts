@@ -48,6 +48,13 @@ let tokenExpiresAt: number | null = null; // Store token expiration timestamp
 let lastHealthCheck: number = 0; // Track last health check time
 const HEALTH_CHECK_INTERVAL = 10 * 60 * 1000; // Check health every 10 minutes
 
+// 🔄 PERSISTENT AUTH: Device registration and grace period
+let deviceId: string | null = null;
+let isDeviceRegistered: boolean = false;
+const TOKEN_GRACE_PERIOD_DAYS = 7; // Allow expired tokens for 7 days
+const MAX_AUTH_RETRY_ATTEMPTS = 10; // Increased from 3
+const AUTH_RETRY_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000]; // Exponential backoff up to 30s
+
 // 📊 External Edit Tracking - Track file line counts for external edits (e.g., Claude)
 const fileLineBaseline = new Map<string, number>();
 
@@ -1177,7 +1184,10 @@ async function retryWithBackoff<T>(
       
       // Don't retry on the last attempt
       if (attempt < maxRetries - 1) {
-        const delay = initialDelay * Math.pow(2, attempt);
+        // Use AUTH_RETRY_DELAYS array if available for auth operations
+        const delay = (maxRetries === MAX_AUTH_RETRY_ATTEMPTS && AUTH_RETRY_DELAYS[attempt]) 
+          ? AUTH_RETRY_DELAYS[attempt] 
+          : initialDelay * Math.pow(2, attempt);
         console.log(`[FROLIC] Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
@@ -1283,8 +1293,8 @@ async function performTokenRefresh(context: vscode.ExtensionContext, refreshToke
     try {
       const result = await retryWithBackoff(
         () => refreshAccessToken(context, refreshToken),
-        3, // max retries
-        2000 // initial delay
+        MAX_AUTH_RETRY_ATTEMPTS, // Use increased retry attempts
+        AUTH_RETRY_DELAYS[0] // Use new delay array
       );
       
       // If all retries failed, check network before clearing tokens
@@ -1320,6 +1330,10 @@ async function performTokenRefresh(context: vscode.ExtensionContext, refreshToke
  * Clear all authentication tokens and reset auth state
  */
 async function clearAllAuthTokens(context: vscode.ExtensionContext): Promise<void> {
+  // Clear API key (new auth method)
+  await context.secrets.delete('frolic.apiKey');
+  
+  // Clear OAuth tokens (legacy)
   await context.secrets.delete('frolic.accessToken');
   await context.secrets.delete('frolic.refreshToken');
   await context.secrets.delete('frolic.codeVerifier');
@@ -1432,6 +1446,95 @@ async function performHealthCheck(context: vscode.ExtensionContext, accessToken:
   } catch (err: any) {
     console.log('[FROLIC] Health check error:', err.message);
     return false; // Assume unhealthy on error
+  }
+}
+
+/**
+ * Get or generate a unique device ID for this VS Code installation
+ */
+async function getDeviceId(context: vscode.ExtensionContext): Promise<string> {
+  // Check if we already have a device ID stored
+  let storedDeviceId = await context.globalState.get<string>('frolic.deviceId');
+  
+  if (!storedDeviceId) {
+    // Generate a new device ID based on machine ID and VS Code session
+    const machineId = vscode.env.machineId;
+    const sessionId = vscode.env.sessionId;
+    
+    // Create a hash of machine ID + a random component for uniqueness
+    const uniqueString = `${machineId}-${crypto.randomUUID()}`;
+    storedDeviceId = crypto.createHash('sha256').update(uniqueString).digest('hex').substring(0, 32);
+    
+    // Store it for future use
+    await context.globalState.update('frolic.deviceId', storedDeviceId);
+    console.log('[FROLIC] Generated new device ID:', storedDeviceId);
+  }
+  
+  deviceId = storedDeviceId;
+  return storedDeviceId;
+}
+
+/**
+ * Register this device with the backend
+ */
+async function registerDevice(context: vscode.ExtensionContext, accessToken: string): Promise<boolean> {
+  try {
+    const apiBaseUrl = getApiBaseUrl();
+    const deviceId = await getDeviceId(context);
+    const deviceName = `${vscode.env.appHost} - ${vscode.env.appName}`;
+    
+    const response = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/device/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({
+        deviceId: deviceId,
+        deviceName: deviceName,
+        vscodeVersion: vscode.version,
+        platform: process.platform
+      })
+    }, 10000);
+    
+    if (response.ok) {
+      isDeviceRegistered = true;
+      console.log('[FROLIC] Device registered successfully');
+      return true;
+    } else {
+      console.error('[FROLIC] Failed to register device:', response.status);
+      return false;
+    }
+  } catch (err: any) {
+    console.error('[FROLIC] Error registering device:', err.message);
+    return false;
+  }
+}
+
+/**
+ * Check if token is expired beyond the grace period
+ */
+async function isTokenExpiredBeyondGracePeriod(context: vscode.ExtensionContext): Promise<boolean> {
+  try {
+    const accessToken = await context.secrets.get('frolic.accessToken');
+    if (!accessToken) return true;
+    
+    const parts = accessToken.split('.');
+    if (parts.length !== 3) return true;
+    
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+    const now = Math.floor(Date.now() / 1000);
+    
+    if (!payload.exp) return false; // No expiration
+    
+    // Check if token expired more than grace period days ago
+    const gracePeriodSeconds = TOKEN_GRACE_PERIOD_DAYS * 24 * 60 * 60;
+    const expiredForSeconds = now - payload.exp;
+    
+    return expiredForSeconds > gracePeriodSeconds;
+  } catch (err) {
+    console.error('[FROLIC] Error checking token grace period:', err);
+    return true;
   }
 }
 
@@ -1777,6 +1880,255 @@ function detectAICollaborationPatterns(changeText: string, change: any): any {
   return signals;
 }
 
+/**
+ * Enhanced Code Capture: Importance Scoring System
+ * Determines how important a code change is for LLM context
+ */
+interface ImportanceFactors {
+  size: number;
+  pattern: number;
+  context: number;
+  editPattern: number;
+  aiSignal: number;
+}
+
+function calculateImportanceScore(
+  change: any,
+  changeText: string,
+  context: {
+    isTestFile: boolean;
+    isConfigFile: boolean;
+    isFirstEditInSession: boolean;
+    editFrequency: number;
+    hasMultipleRevisions: boolean;
+    hasRevert: boolean;
+    rapidEdits: number;
+  }
+): { score: number; factors: ImportanceFactors } {
+  const factors: ImportanceFactors = {
+    size: 0,
+    pattern: 0,
+    context: 0,
+    editPattern: 0,
+    aiSignal: 0
+  };
+  
+  // Size scoring (0-25 points)
+  if (change.textLength > 200) factors.size = 25;
+  else if (change.textLength > 100) factors.size = 20;
+  else if (change.textLength > 50) factors.size = 15;
+  else if (change.textLength > 20) factors.size = 10;
+  
+  // Pattern scoring (0-30 points)
+  const importantPatterns = [
+    { regex: /^(export\s+)?(default\s+)?(class|interface|type|enum)\s+\w+/m, points: 30 },
+    { regex: /^(export\s+)?(async\s+)?function\s+\w+/m, points: 28 },
+    { regex: /^(export\s+)?const\s+[A-Z]\w+\s*[:=]/m, points: 26 },
+    { regex: /\.(get|post|put|delete|patch)\s*\(/, points: 25 },
+    { regex: /^(describe|it|test)\s*\(/m, points: 24 },
+    { regex: /try\s*{|catch\s*\(|\.catch\(/, points: 22 },
+    { regex: /import\s+.*from|export\s+/, points: 15 }
+  ];
+  
+  for (const { regex, points } of importantPatterns) {
+    if (regex.test(changeText)) {
+      factors.pattern = Math.max(factors.pattern, points);
+    }
+  }
+  
+  // Context scoring (0-20 points)
+  if (context.isTestFile) factors.context += 10;
+  if (context.isConfigFile) factors.context += 10;
+  if (context.isFirstEditInSession) factors.context += 5;
+  if (context.editFrequency > 0.3) factors.context += 5;
+  
+  // Edit pattern scoring (0-15 points)
+  if (context.hasMultipleRevisions) factors.editPattern = 15;
+  else if (context.hasRevert) factors.editPattern = 10;
+  else if (context.rapidEdits > 3) factors.editPattern = 5;
+  
+  // AI signal scoring (0-10 points)
+  if (change.aiCollaborationSignals?.isLikelyAI || change.likelyAI) {
+    factors.aiSignal = 10;
+  }
+  
+  const totalScore = Object.values(factors).reduce((sum, val) => sum + val, 0);
+  
+  return { score: totalScore, factors };
+}
+
+/**
+ * Fetch API key from backend after OAuth authentication
+ */
+async function fetchApiKeyAfterOAuth(context: vscode.ExtensionContext): Promise<string | null> {
+  try {
+    const accessToken = await context.secrets.get('frolic.accessToken');
+    if (!accessToken) {
+      console.log('[FROLIC] No access token available to fetch API key');
+      return null;
+    }
+    
+    const apiBaseUrl = getApiBaseUrl();
+    const response = await fetchWithTimeout(`${apiBaseUrl}/api/user/api-key`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'VSCode-Frolic-Extension/1.2.6-rc2'
+      }
+    }, 10000);
+    
+    if (response.ok) {
+      const data = await response.json();
+      if (data.api_key) {
+        console.log('[FROLIC] Successfully fetched API key from backend');
+        return data.api_key;
+      }
+    }
+    
+    console.log('[FROLIC] Failed to fetch API key:', response.status);
+    return null;
+  } catch (error) {
+    console.log('[FROLIC] Error fetching API key:', error);
+    return null;
+  }
+}
+
+/**
+ * Enhanced Code Capture: Intelligent Code Extraction
+ * Extracts meaningful, complete code blocks instead of arbitrary truncation
+ */
+function extractMeaningfulCode(changeText: string, maxLength: number): string {
+  // Try to find complete functions
+  const functionRegex = /((?:export\s+)?(?:async\s+)?function\s+\w+\s*\([^)]*\)\s*(?::\s*\w+\s*)?\s*\{[\s\S]*?\n\})/g;
+  const functions = changeText.match(functionRegex);
+  if (functions) {
+    for (const func of functions) {
+      if (func.length <= maxLength) return func;
+    }
+  }
+  
+  // Try to find complete classes
+  const classRegex = /((?:export\s+)?(?:abstract\s+)?class\s+\w+(?:\s+extends\s+\w+)?(?:\s+implements\s+\w+)?\s*\{[\s\S]*?\n\})/g;
+  const classes = changeText.match(classRegex);
+  if (classes) {
+    for (const cls of classes) {
+      if (cls.length <= maxLength) return cls;
+    }
+  }
+  
+  // Try to find complete React components
+  const componentRegex = /((?:export\s+)?(?:const|function)\s+[A-Z]\w+\s*[:=]\s*(?:\([^)]*\)\s*=>|\([^)]*\):\s*\w+\s*=>|function\s*\([^)]*\))\s*(?:\{[\s\S]*?\n\}|\([\s\S]*?\n\)))/g;
+  const components = changeText.match(componentRegex);
+  if (components) {
+    for (const comp of components) {
+      if (comp.length <= maxLength) return comp;
+    }
+  }
+  
+  // Skip past comments/headers to actual code
+  const codeStart = changeText.search(/^(?!\/\/|\/\*|\s*\*|#|\s*$)/m);
+  if (codeStart > 0 && codeStart < 200) {
+    return changeText.substring(codeStart, codeStart + maxLength);
+  }
+  
+  // Default: return from start
+  return changeText.substring(0, maxLength);
+}
+
+/**
+ * Categorizes the type of code change for better understanding
+ */
+function categorizeChange(changeText: string): string {
+  if (/import\s+.*from/.test(changeText)) return 'import';
+  if (/export\s+(?:default|const|function|class)/.test(changeText)) return 'export';
+  if (/interface\s+\w+|type\s+\w+\s*=/.test(changeText)) return 'type_definition';
+  if (/class\s+\w+/.test(changeText)) return 'class_definition';
+  if (/(?:function\s+\w+|const\s+\w+\s*=\s*(?:async\s*)?\()/.test(changeText)) return 'function_definition';
+  if (/\.(test|spec|describe|it|expect)\s*\(/.test(changeText)) return 'test';
+  if (/return\s+|if\s*\(|for\s*\(|while\s*\(/.test(changeText)) return 'implementation';
+  return 'other';
+}
+
+/**
+ * Enhanced Code Capture: Semantic Entity Extraction
+ * Extracts function names, classes, components, and other entities from code
+ */
+interface ExtractedEntities {
+  functions: string[];
+  classes: string[];
+  components: string[];
+  imports: string[];
+  exports: string[];
+}
+
+function extractSemanticEntities(changeText: string): ExtractedEntities {
+  const entities: ExtractedEntities = {
+    functions: [],
+    classes: [],
+    components: [],
+    imports: [],
+    exports: []
+  };
+  
+  // Extract function names
+  const functionMatches = changeText.matchAll(/(?:(?:export\s+)?(?:async\s+)?function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*(?:=>|{))/g);
+  for (const match of functionMatches) {
+    const name = match[1] || match[2];
+    if (name && !entities.functions.includes(name)) {
+      entities.functions.push(name);
+    }
+  }
+  
+  // Extract class names
+  const classMatches = changeText.matchAll(/class\s+(\w+)/g);
+  for (const match of classMatches) {
+    if (!entities.classes.includes(match[1])) {
+      entities.classes.push(match[1]);
+    }
+  }
+  
+  // Extract React components (PascalCase functions/consts)
+  const componentMatches = changeText.matchAll(/(?:export\s+)?(?:const|function)\s+([A-Z]\w+)\s*[:=]/g);
+  for (const match of componentMatches) {
+    if (!entities.components.includes(match[1])) {
+      entities.components.push(match[1]);
+    }
+  }
+  
+  // Extract imports (just the package/module names)
+  const importMatches = changeText.matchAll(/import\s+(?:.*?)\s+from\s+['"`]([^'"`]+)['"`]/g);
+  for (const match of importMatches) {
+    const pkg = match[1].split('/')[0]; // Get package name
+    if (!entities.imports.includes(pkg)) {
+      entities.imports.push(pkg);
+    }
+  }
+  
+  // Extract exports
+  const exportMatches = changeText.matchAll(/export\s+(?:default\s+)?(?:const|function|class)?\s*(\w+)/g);
+  for (const match of exportMatches) {
+    if (match[1] && !entities.exports.includes(match[1])) {
+      entities.exports.push(match[1]);
+    }
+  }
+  
+  return entities;
+}
+
+/**
+ * Detects code patterns for better understanding of what was implemented
+ */
+function detectCodePatterns(changeText: string): any {
+  return {
+    hasErrorHandling: /try\s*{|catch\s*\(|\.catch\(|throw\s+/.test(changeText),
+    hasTests: /\.(test|spec)\(|describe\(|it\(|expect\(/.test(changeText),
+    hasAsync: /async|await|Promise|\.then\(/.test(changeText),
+    hasStateManagement: /useState|useReducer|setState|dispatch/.test(changeText),
+    hasTypeDefinitions: /interface\s+|type\s+\w+\s*=|:\s*\w+(?:\[\])?(?:\s*[|&])?\s*[;,=]/.test(changeText)
+  };
+}
+
 function analyzeLogs(logs: any[]): any {
   // === RAW DATA COLLECTION (Minimal Processing) ===
   const files = new Set<string>();
@@ -1802,6 +2154,30 @@ function analyzeLogs(logs: any[]): any {
   let codeChangesText = '';
   const codeChangesSample: any[] = [];
   const importStatements: string[] = [];
+  
+  // Enhanced semantic tracking
+  const semanticSummary = {
+    entitiesCreated: {
+      functions: [] as string[],
+      classes: [] as string[],
+      components: [] as string[],
+      totalCount: 0
+    },
+    codingPatterns: {
+      primaryLanguage: '',
+      frameworksUsed: [] as string[],
+      testingApproach: undefined as string | undefined,
+      architectureStyle: undefined as string | undefined
+    },
+    sessionInsights: {
+      focusArea: '',
+      complexityLevel: 'moderate' as 'simple' | 'moderate' | 'complex' | 'advanced',
+      refactoringRatio: 0,
+      debuggingTime: 0
+    }
+  };
+  const importantCodeSamples: any[] = [];
+  const processedFiles = new Set<string>();
   const fileExtensions = new Set<string>();
   const directoryStructure: Record<string, number> = {};
 
@@ -1872,18 +2248,87 @@ function analyzeLogs(logs: any[]): any {
       
       if (change.likelyAI) aiInsertions++;
 
-      // Collect raw code samples (first 100 significant changes)
-      if (changeText.length > 20 && codeChangesSample.length < 100) {
+      // Enhanced code capture with importance scoring
+      if (changeText.length > 10 && codeChangesSample.length < 100) {
+        // Build change context for importance scoring
+        const changeContext = {
+          isTestFile: /\.(test|spec)\.(ts|js|tsx|jsx)$/.test(filePath),
+          isConfigFile: /\.(config|json|env|yaml|yml)$/.test(filePath),
+          isFirstEditInSession: !processedFiles.has(filePath),
+          editFrequency: fileActivity[filePath]?.editPattern?.length ? 
+            fileActivity[filePath].edits / ((new Date(fileActivity[filePath].lastEdit).getTime() - 
+            new Date(fileActivity[filePath].firstEdit).getTime()) / 1000 / 60) : 0,
+          hasMultipleRevisions: (fileActivity[filePath]?.edits || 0) > 5,
+          hasRevert: change.revertCount > 0,
+          rapidEdits: fileActivity[filePath]?.editPattern?.filter((t: number) => t < 5).length || 0
+        };
+        
+        processedFiles.add(filePath);
+        
+        // Calculate importance score
+        const importance = calculateImportanceScore(change, changeText, changeContext);
+        
+        // Determine truncation length based on importance
+        const truncationLength = importance.score > 60 ? 2000 : 
+                               importance.score > 40 ? 1500 : 
+                               importance.score > 20 ? 1000 : 
+                               500;
+        
+        // Extract meaningful code
+        const extractedCode = importance.score > 40 ? 
+          extractMeaningfulCode(changeText, truncationLength) : 
+          changeText.substring(0, truncationLength);
+        
+        // Extract semantic information
+        const entities = extractSemanticEntities(changeText);
+        const patterns = detectCodePatterns(changeText);
+        const category = categorizeChange(changeText);
+        
+        // Update semantic summary
+        semanticSummary.entitiesCreated.functions.push(...entities.functions);
+        semanticSummary.entitiesCreated.classes.push(...entities.classes);
+        semanticSummary.entitiesCreated.components.push(...entities.components);
+        
+        // Build enhanced change object
         codeChangesSample.push({
           file: filePath,
-          language: entry.language,
+          language: entry.language || 'unknown',
           timestamp: entry.timestamp,
-          change: changeText.substring(0, 500), // Limit size but keep raw
+          change: extractedCode,
           size: change.textLength || changeText.length,
           type: (change.textLength || changeText.length) > change.rangeLength ? 'addition' : 'modification',
-          // 🔄 PHASE 2.1: Enhanced AI collaboration detection
-          aiCollaborationSignals: detectAICollaborationPatterns(changeText, change)
+          aiCollaborationSignals: detectAICollaborationPatterns(changeText, change),
+          
+          // NEW: Semantic metadata
+          semantic: {
+            modifiedEntity: entities.functions[0] || entities.classes[0] || entities.components[0],
+            changeCategory: category,
+            fullContext: importance.score > 60 && changeText.length < 2000 ? changeText : undefined,
+            entities: entities,
+            patterns: patterns
+          },
+          
+          // NEW: Importance data
+          importance: {
+            score: importance.score,
+            factors: importance.factors,
+            isImportant: importance.score > 40
+          }
         });
+        
+        // Collect important complete code samples
+        if (importance.score > 60 && (entities.functions.length > 0 || entities.classes.length > 0)) {
+          const entityName = entities.functions[0] || entities.classes[0] || 'Unknown';
+          const explanation = `${category} with importance score ${importance.score}`;
+          
+          importantCodeSamples.push({
+            file: filePath,
+            entity: entityName,
+            category: category,
+            fullCode: changeText.substring(0, 2000),
+            explanation: explanation
+          });
+        }
       }
 
       // Extract import statements (structural information)
@@ -1915,6 +2360,54 @@ function analyzeLogs(logs: any[]): any {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
 
+  // Finalize semantic summary
+  semanticSummary.entitiesCreated.functions = [...new Set(semanticSummary.entitiesCreated.functions)];
+  semanticSummary.entitiesCreated.classes = [...new Set(semanticSummary.entitiesCreated.classes)];
+  semanticSummary.entitiesCreated.components = [...new Set(semanticSummary.entitiesCreated.components)];
+  semanticSummary.entitiesCreated.totalCount = 
+    semanticSummary.entitiesCreated.functions.length +
+    semanticSummary.entitiesCreated.classes.length +
+    semanticSummary.entitiesCreated.components.length;
+
+  // Determine session characteristics
+  const languageCounts = Object.entries(langCounts).sort((a, b) => b[1] - a[1]);
+  semanticSummary.codingPatterns.primaryLanguage = languageCounts[0]?.[0] || 'unknown';
+
+  // Detect frameworks from imports
+  const frameworkDetection: Record<string, string[]> = {
+    'react': ['React', 'React.js'],
+    'vue': ['Vue', 'Vue.js'],
+    'angular': ['Angular'],
+    'next': ['Next.js'],
+    'express': ['Express'],
+    'fastify': ['Fastify'],
+    'nestjs': ['NestJS'],
+    '@testing-library': ['React Testing Library'],
+    'jest': ['Jest'],
+    'vitest': ['Vitest']
+  };
+
+  for (const imp of importStatements) {
+    for (const [pkg, frameworks] of Object.entries(frameworkDetection)) {
+      if (imp.includes(pkg)) {
+        semanticSummary.codingPatterns.frameworksUsed.push(...frameworks);
+      }
+    }
+  }
+  semanticSummary.codingPatterns.frameworksUsed = [...new Set(semanticSummary.codingPatterns.frameworksUsed)];
+
+  // Determine focus area based on files and languages
+  if (topFiles.some(f => f.file.match(/\.(tsx?|jsx?)$/)) && 
+      topFiles.some(f => f.file.match(/(component|page|view)/i))) {
+    semanticSummary.sessionInsights.focusArea = 'Frontend Development';
+  } else if (topFiles.some(f => f.file.match(/(api|server|route|controller)/i))) {
+    semanticSummary.sessionInsights.focusArea = 'Backend Development';
+  } else if (topFiles.some(f => f.file.match(/\.(test|spec)\./))) {
+    semanticSummary.sessionInsights.focusArea = 'Testing';
+  } else {
+    semanticSummary.sessionInsights.focusArea = 'General Development';
+  }
+
   // === RETURN RAW DATA + MINIMAL STRUCTURE ===
   return {
     // === BACKWARDS COMPATIBLE (keep existing fields) ===
@@ -1938,9 +2431,15 @@ function analyzeLogs(logs: any[]): any {
       workingDirectories: workingDirectories,
       detailedFileActivity: topFiles,
       
-      // Raw code samples for LLM analysis
+      // Enhanced code samples with semantic data
       codeChangesSample: codeChangesSample,
       importStatements: Array.from(new Set(importStatements)).slice(0, 20),
+      
+      // NEW: Semantic analysis summary
+      semanticSummary: semanticSummary,
+      
+      // NEW: Important code samples for LLM context
+      importantCodeSamples: importantCodeSamples.slice(0, 10),
     
     // 🔄 PHASE 2.2: Learning Struggle Detection Data
     struggleIndicators: {
@@ -2246,8 +2745,8 @@ function analyzeLogs(logs: any[]): any {
     await context.secrets.store('frolic.codeVerifier', codeVerifier);
     await context.secrets.store('frolic.state', state);
     
-          // Build auth URL
-      const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}`;
+          // Build auth URL - always request API key for seamless experience
+      const authUrl = `${apiBaseUrl}/api/auth/vscode/start?state=${state}&code_challenge=${codeChallenge}&token_type=${tokenExpiration}&source=vscode`;
       
       // Show initial progress message
     const progressResult = await vscode.window.withProgress({
@@ -2274,18 +2773,18 @@ function analyzeLogs(logs: any[]): any {
         throw new Error('Sign-in cancelled by user');
       }
       
-      // Prompt for code with enhanced UX
+      // Prompt for API key
       const code = await vscode.window.showInputBox({
         title: 'Frolic Authentication',
-        prompt: 'Paste the authentication code from your browser',
-        placeHolder: 'e.g., abc123def456...',
+        prompt: 'Paste your API key from the browser',
+        placeHolder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
         ignoreFocusOut: true,
         validateInput: (value) => {
           if (!value || value.trim().length === 0) {
-            return 'Please enter the authentication code';
+            return 'Please enter your API key';
           }
           if (value.trim().length < 10) {
-            return 'Authentication code seems too short';
+            return 'API key seems too short';
           }
           return null;
         }
@@ -2295,92 +2794,36 @@ function analyzeLogs(logs: any[]): any {
         throw new Error('No authentication code provided');
       }
       
-      progress.report({ message: "Exchanging code for tokens..." });
+      // Validate API key format
+      const trimmedCode = code.trim();
+      const isValidApiKey = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmedCode);
       
-      // Exchange code for tokens
-      const storedCodeVerifier = await context.secrets.get('frolic.codeVerifier');
-      const storedState = await context.secrets.get('frolic.state');
-      
-      const tokenResponse = await fetchWithTimeout(`${apiBaseUrl}/api/auth/vscode/token`, {
-        method: 'POST',
-                  headers: { 
-            'Content-Type': 'application/json',
-            'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
-          },
-        body: JSON.stringify({ 
-          code: code.trim(), 
-          state: storedState, 
-          code_verifier: storedCodeVerifier,
-          token_type: tokenExpiration
-        })
-      }, 15000);
-      
-      if (!tokenResponse.ok) {
-        const errorText = await tokenResponse.text();
-        console.error(`[FROLIC] Token exchange failed: ${tokenResponse.status} ${errorText}`);
-        
-        if (tokenResponse.status === 400) {
-          throw new Error('Invalid or expired authentication code. Please try again.');
-        } else if (tokenResponse.status === 401) {
-          throw new Error('Authentication failed. Please try again.');
-        } else {
-          throw new Error(`Authentication server error (${tokenResponse.status}). Please try again later.`);
-        }
+      if (!isValidApiKey) {
+        throw new Error('Invalid API key format. Please copy the complete API key from the browser.');
       }
       
-      const tokenData = await tokenResponse.json();
-      const accessToken = tokenData.accessToken || tokenData.access_token;
-      const refreshToken = tokenData.refresh_token;
+      // Store API key directly
+      progress.report({ message: "Storing API key..." });
+      console.log('[FROLIC] Storing API key for seamless authentication');
+      await context.secrets.store('frolic.apiKey', trimmedCode);
       
-      if (!accessToken) {
-        throw new Error('No access token received from server');
-      }
-      
-              progress.report({ message: "Saving authentication..." });
-        
-        // Store tokens securely
-        await context.secrets.store('frolic.accessToken', accessToken);
-        
-        if (refreshToken) {
-          await context.secrets.store('frolic.refreshToken', refreshToken);
-        }
-        
-        // Store token expiration time if provided
-        if (tokenData.expires_at) {
-          tokenExpiresAt = Number(tokenData.expires_at);
-          await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
-          console.log(`[FROLIC] Initial token expires at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
-        } else if (tokenData.expires_in) {
-          // Calculate expiration from expires_in
-          const now = Math.floor(Date.now() / 1000);
-          tokenExpiresAt = now + Number(tokenData.expires_in);
-          await context.globalState.update('frolic.tokenExpiresAt', tokenExpiresAt);
-          console.log(`[FROLIC] Initial token expires in ${tokenData.expires_in}s, at: ${new Date(tokenExpiresAt * 1000).toISOString()}`);
-        }
-      
-      // Clean up PKCE parameters
+      // Clean up any old PKCE parameters
       await context.secrets.delete('frolic.codeVerifier');
       await context.secrets.delete('frolic.state');
+      await context.secrets.delete('frolic.accessToken');
+      await context.secrets.delete('frolic.refreshToken');
       
-      return { accessToken, refreshToken };
-          });
-      
-      // Verify tokens were stored successfully
-      const finalAccessToken = await context.secrets.get('frolic.accessToken');
-      
-      if (!finalAccessToken) {
-        console.error('[FROLIC] Critical: Access token missing after sign-in');
-        vscode.window.showErrorMessage('Authentication failed: Tokens were not saved properly. Please try again.');
-        updateStatusBar('unauthenticated');
-        return;
-      }
+      return { apiKey: trimmedCode };
+    });
     
+    // If user cancelled or no result
+    if (!progressResult) {
+      updateStatusBar('unauthenticated');
+      return;
+    }
+    
+    // Success! API key is stored
     updateStatusBar('authenticated');
-    
-    // Start background token refresh after successful sign-in
-    startBackgroundTokenRefresh(context);
-    
-    // Show success message
     vscode.window.showInformationMessage('✅ Frolic: Successfully signed in!');
     
     // Refresh activity panel to show updated auth status
@@ -2426,6 +2869,15 @@ function analyzeLogs(logs: any[]): any {
  */
 async function initializeAuthenticationFlow(context: vscode.ExtensionContext) {
     try {
+        // Check for API key first (new auth method)
+        const apiKey = await context.secrets.get('frolic.apiKey');
+        if (apiKey) {
+            console.log('[FROLIC] API key found, user is authenticated');
+            updateStatusBar('authenticated');
+            return; // No need for token refresh with API keys!
+        }
+        
+        // Fall back to OAuth token check (legacy)
         const accessToken = await context.secrets.get('frolic.accessToken');
         const isFirstRun = context.globalState.get('frolic.hasEverRun', false);
         const hasShownWelcome = context.globalState.get('frolic.hasShownWelcome', false);
@@ -2862,6 +3314,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register the sign-in command
     const signInCmd = vscode.commands.registerCommand('frolic.signIn', () => signInCommand(context));
     context.subscriptions.push(signInCmd);
+    
 
     // Register welcome walkthrough command
     const showWelcomeCmd = vscode.commands.registerCommand('frolic.showWelcome', async () => {
@@ -2980,9 +3433,10 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register open skills webview command
     const openSkillsCmd = vscode.commands.registerCommand('frolic.openSkills', async () => {
         try {
-            // Check if authenticated first
-            const accessToken = await getValidAccessToken(context);
-            if (!accessToken) {
+            // Check if authenticated first (API key or OAuth token)
+            const apiKey = await context.secrets.get('frolic.apiKey');
+            const accessToken = apiKey ? 'api-key' : await getValidAccessToken(context);
+            if (!accessToken && !apiKey) {
                 // Show sign in options
                 const quickPick = vscode.window.createQuickPick();
                 quickPick.title = 'Frolic Skills';
@@ -3035,11 +3489,11 @@ export async function activate(context: vscode.ExtensionContext) {
             try {
                 const skillsData = await fetchSkillsData(context);
                 console.log('[FROLIC] Skills data received:', skillsData);
-            
-            const renderSkills = (skills: any[], showAll: boolean = false) => {
+                
+                const renderSkills = (skills: any[], showAll: boolean = false) => {
                 console.log('[FROLIC] Rendering skills, showAll:', showAll);
                 
-                // Filter to only the correct 10 skills from the technical design
+                // Filter to only the correct 12 skills from the technical design
                 const CORRECT_SKILLS = [
                     'Programming Fundamentals',
                     'Software Design & Architecture', 
@@ -3048,8 +3502,10 @@ export async function activate(context: vscode.ExtensionContext) {
                     'DevOps & Infrastructure',
                     'Security & Auth',
                     'Testing & Quality Assurance',
-                    'Developer Tooling & Workflow',
-                    'Team Collaboration & Project Skills',
+                    'Developer Productivity & Collaboration',
+                    'Mobile Development',
+                    'Databases & Data Modeling',
+                    'Data Engineering & Analytics',
                     'AI, Learning, & Prompting'
                 ];
                 
@@ -3716,7 +4172,7 @@ function stopPeriodicDigestSending() {
     }
 }
 
-function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthenticated' | 'sending' | 'error') {
+function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthenticated' | 'sending' | 'error' | 'offline' | 'needs-reauth') {
     if (!statusBarItem) return;
     
     switch (status) {
@@ -3736,6 +4192,18 @@ function updateStatusBar(status: 'initializing' | 'authenticated' | 'unauthentic
             statusBarItem.text = '$(sign-in) Connect Frolic';
             statusBarItem.tooltip = 'Frolic: Click to sign in';
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            statusBarItem.command = 'frolic.signIn';
+            break;
+        case 'offline':
+            statusBarItem.text = '$(cloud-offline) Frolic Offline';
+            statusBarItem.tooltip = 'Frolic: Working offline, digests will sync when reconnected. Click to retry.';
+            statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            statusBarItem.command = 'frolic.sendDigest';
+            break;
+        case 'needs-reauth':
+            statusBarItem.text = '$(key) Frolic Re-auth Needed';
+            statusBarItem.tooltip = 'Frolic: Authentication expired. Click to sign in again.';
+            statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
             statusBarItem.command = 'frolic.signIn';
             break;
         case 'sending':
@@ -4162,6 +4630,24 @@ class FrolicActivityProvider implements vscode.TreeDataProvider<FrolicTreeItem> 
     }
 
     private async getAuthStatusItems(): Promise<FrolicTreeItem[]> {
+        // Check for API key first
+        const apiKey = await this.context.secrets.get('frolic.apiKey');
+        if (apiKey) {
+            return [
+                new FrolicTreeItem(
+                    'Sign Out',
+                    vscode.TreeItemCollapsibleState.None,
+                    'auth-item',
+                    {
+                        command: 'frolic.signOut',
+                        title: 'Sign Out'
+                    },
+                    new vscode.ThemeIcon('account')
+                )
+            ];
+        }
+        
+        // Fall back to OAuth token check
         const accessToken = await getValidAccessToken(this.context);
         const status = accessToken ? 'authenticated' : 'unauthenticated';
         const label = status === 'authenticated' ? `Sign Out` : 'Sign In';
@@ -4212,8 +4698,53 @@ export async function sendDigestToBackend(
   context: vscode.ExtensionContext
 ) {
   const apiBaseUrl = getApiBaseUrl();
+  
+  // Check for API key first (new auth method)
+  const apiKey = await context.secrets.get('frolic.apiKey');
+  if (apiKey) {
+    // Use new public endpoint with API key
+    const apiUrl = `${apiBaseUrl}/api/digests/public`;
+    console.log(`[FROLIC] Sending digest via API key to: ${apiUrl}`);
+    
+    try {
+      const res = await fetchWithTimeout(apiUrl, {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'User-Agent': 'VSCode-Frolic-Extension/1.2.6-rc2'
+        },
+        body: JSON.stringify({ sessionId, digest })
+      }, 30000);
+      
+      if (res.ok) {
+        return await res.json();
+      }
+      
+      if (res.status === 401) {
+        // Invalid API key
+        await context.secrets.delete('frolic.apiKey');
+        updateStatusBar('unauthenticated');
+        vscode.window.showErrorMessage('Frolic: Invalid API key. Please set a new one.');
+        throw new Error('INVALID_API_KEY');
+      } else if (res.status === 429) {
+        // Rate limited
+        console.log('[FROLIC] Rate limited by server');
+        throw new Error('RATE_LIMITED');
+      } else {
+        const errorText = await res.text();
+        console.error('[FROLIC] API key digest failed:', res.status, errorText);
+        throw new Error(`API_ERROR: ${res.status}`);
+      }
+    } catch (error) {
+      console.error('[FROLIC] Digest send error:', error);
+      throw error;
+    }
+  }
+  
+  // Fall back to OAuth token method (legacy)
   const apiUrl = `${apiBaseUrl}/api/digests`;
-  console.log(`[FROLIC] Sending digest to: ${apiUrl}`);
+  console.log(`[FROLIC] Sending digest via OAuth to: ${apiUrl}`);
   
   // Try to get a valid access token (will refresh if needed)
   const accessToken = await getValidAccessToken(context);
@@ -4235,7 +4766,9 @@ export async function sendDigestToBackend(
       delete cleanDigest.rawData.errorTrackingData;
       delete cleanDigest.rawData.projectStructure;
     }
-    serializedBody = JSON.stringify({ sessionId, digest: cleanDigest });
+    // PERSISTENT AUTH: Include device ID in request
+    const deviceId = await getDeviceId(context);
+    serializedBody = JSON.stringify({ sessionId, digest: cleanDigest, deviceId });
   } catch (jsonError) {
     console.error('[FROLIC] JSON serialization failed - circular reference detected:', jsonError);
     throw new Error(`JSON_SERIALIZATION_ERROR: ${jsonError instanceof Error ? jsonError.message : 'Unknown error'}`);
@@ -4364,20 +4897,31 @@ export async function sendDigestToBackend(
                   );
                   return { queued: true };
                 } else if (retryRes.status === 401) {
-                  // Only clear all tokens after exhausting retries with network available
-                  console.log('[FROLIC] All retry attempts failed with 401 - clearing all auth state');
-                  await clearAllAuthTokens(context);
-                  updateStatusBar('unauthenticated');
-                  console.log('[FROLIC] Authentication expired. User will need to manually sign in.');
+                  // PERSISTENT AUTH: Don't clear tokens immediately
+                  console.log('[FROLIC] All retry attempts failed with 401 - entering degraded mode');
+                  updateStatusBar('offline'); // Show offline mode instead of unauthenticated
+                  
+                  // Queue digest for later retry
+                  queueDigestForOfflineProcessing(sessionId, digest);
+                  
+                  // Check if token is expired beyond grace period
+                  const tokenExpired = await isTokenExpiredBeyondGracePeriod(context);
+                  if (tokenExpired) {
+                    console.log('[FROLIC] Token expired beyond grace period - user needs to re-authenticate');
+                    updateStatusBar('needs-reauth');
+                  }
+                  
+                  return { queued: true, authDegraded: true };
                 }
-                throw new Error('AUTH_TOKEN_EXPIRED');
+                throw new Error('AUTH_DEGRADED');
               }
             }
           } else if (attempt === MAX_RETRY_ATTEMPTS) {
             console.log('[FROLIC] Could not refresh token after all attempts');
-            await clearAllAuthTokens(context);
-            updateStatusBar('unauthenticated');
-            throw new Error('AUTH_TOKEN_EXPIRED');
+            // PERSISTENT AUTH: Don't clear tokens, enter degraded mode
+            updateStatusBar('offline');
+            queueDigestForOfflineProcessing(sessionId, digest);
+            return { queued: true, authDegraded: true };
           }
         }
       } else if (res.status === 403) {
@@ -4428,6 +4972,43 @@ async function fetchSkillsData(context: vscode.ExtensionContext): Promise<any[]>
   const apiBaseUrl = getApiBaseUrl();
   console.log('[FROLIC] Skills API base URL:', apiBaseUrl);
   
+  // Check for API key first (new auth method)
+  const apiKey = await context.secrets.get('frolic.apiKey');
+  if (apiKey) {
+    console.log('[FROLIC] Using API key for skills fetch');
+    
+    try {
+      const response = await fetchWithTimeout(`${apiBaseUrl}/api/skills/public`, {
+        method: 'GET',
+        headers: {
+          'x-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'User-Agent': 'VSCode-Frolic-Extension/1.2.6-rc2'
+        }
+      }, 30000);
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log('[FROLIC] Skills data fetched via API key');
+        return data.data || [];
+      }
+      
+      if (response.status === 401) {
+        // Invalid API key
+        await context.secrets.delete('frolic.apiKey');
+        updateStatusBar('unauthenticated');
+        throw new Error('Invalid API key');
+      }
+      
+      const errorText = await response.text();
+      throw new Error(`Failed to fetch skills: ${response.status} - ${errorText}`);
+    } catch (error: any) {
+      console.error('[FROLIC] Error fetching skills with API key:', error);
+      throw error;
+    }
+  }
+  
+  // Fall back to OAuth method
   const accessToken = await getValidAccessToken(context);
   
   if (!accessToken) {
@@ -4443,7 +5024,7 @@ async function fetchSkillsData(context: vscode.ExtensionContext): Promise<any[]>
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
-        'User-Agent': 'VSCode-Frolic-Extension/1.1.1'
+        'User-Agent': 'VSCode-Frolic-Extension/1.2.6-rc2'
       }
     }, 30000);
     
